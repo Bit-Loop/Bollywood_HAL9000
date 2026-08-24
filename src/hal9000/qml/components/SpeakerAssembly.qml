@@ -3,6 +3,10 @@ import "."
 
 Item {
     id: root
+    activeFocusOnTab: !drawerOpen
+    Accessible.role: Accessible.Button
+    Accessible.name: drawerOpen ? "Close HAL manual console" : "Open HAL manual console"
+    Accessible.description: "Opens the transcript and typed command controls"
     property bool drawerOpen: false
     property real speakerLevel: 0.0
     property bool visualizationEnabled: true
@@ -16,7 +20,22 @@ Item {
     signal stopSpeechRequested()
     signal approvalAnswered(string requestId, string choice)
     signal grilleClicked()
+    signal keyboardToggleRequested()
     signal interaction()
+
+    Accessible.onPressAction: root.keyboardToggleRequested()
+    Keys.onReturnPressed: event => {
+        root.keyboardToggleRequested()
+        event.accepted = true
+    }
+    Keys.onEnterPressed: event => {
+        root.keyboardToggleRequested()
+        event.accepted = true
+    }
+    Keys.onSpacePressed: event => {
+        root.keyboardToggleRequested()
+        event.accepted = true
+    }
 
     property real reveal: drawerOpen ? 1.0 : 0.0
     Behavior on reveal {
@@ -29,8 +48,8 @@ Item {
     Rectangle {
         anchors.fill: parent
         radius: Math.max(1, width * 0.004)
-        border.width: Math.max(1, width * 0.004)
-        border.color: "#d7d8d3"
+        border.width: root.activeFocus ? Math.max(2, width * 0.006) : Math.max(1, width * 0.004)
+        border.color: root.activeFocus ? "#f2f3ee" : "#d7d8d3"
         gradient: Gradient {
             orientation: Gradient.Horizontal
             GradientStop { position: 0.00; color: "#303230" }

@@ -183,7 +183,7 @@ ApplicationWindow {
                                              )
         x: window.portrait
            ? consoleFrame.x + (consoleFrame.width - width) / 2
-           : consoleFrame.x + consoleFrame.width * 0.585
+           : consoleFrame.x + consoleFrame.width * 0.7625 - width / 2
         y: consoleFrame.y + consoleFrame.height * (window.portrait ? 0.235 : 0.205)
         width: diameter
         height: width
@@ -210,6 +210,12 @@ ApplicationWindow {
         ttsEngine: controller.ttsEngine
         microphoneMuted: controller.microphoneMuted
         onGrilleClicked: controller.speakerClick()
+        onKeyboardToggleRequested: {
+            if (controller.manualOpen)
+                controller.closeManual()
+            else
+                controller.openManual()
+        }
         onSendText: text => controller.sendText(text)
         onMicrophoneRequested: controller.toggleManualMic()
         onStopGenerationRequested: controller.stopGeneration()

@@ -131,6 +131,25 @@ def test_double_then_triple_speaker_control_never_reopens_drawer(qtbot, tmp_path
         close_ui(qtbot, controller, engine, window)
 
 
+def test_speaker_control_is_keyboard_focusable_and_opens_with_return(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        speaker = window.findChild(QObject, "speakerAssembly")
+        assert speaker is not None
+        assert speaker.property("activeFocusOnTab") is True
+
+        context = QQmlEngine.contextForObject(speaker)
+        focus_speaker = QQmlExpression(context, speaker, "forceActiveFocus()")
+        focus_speaker.evaluate()
+        assert not focus_speaker.hasError(), focus_speaker.error().toString()
+        assert speaker.property("activeFocus") is True
+
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        qtbot.waitUntil(lambda: controller.manualOpen, timeout=700)
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
 def test_required_responsive_sizes_keep_physical_components_in_bounds(qtbot, tmp_path) -> None:
     controller, engine, window = build_ui(qtbot, tmp_path)
     try:
@@ -179,6 +198,27 @@ def test_hal_chassis_spans_window_width_without_stretching_optics(qtbot, tmp_pat
             assert eye.property("width") <= min(
                 console.property("width"), console.property("height")
             )
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_landscape_eye_remains_centered_in_right_hardware_bay(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        console = window.findChild(QObject, "consoleFrame")
+        eye = window.findChild(QObject, "halEye")
+        assert console is not None and eye is not None
+
+        for width, height in ((1280, 900), (1600, 800), (1920, 800)):
+            window.setWidth(width)
+            window.setHeight(height)
+            QTest.qWait(40)
+
+            right_bay_center = (
+                console.property("x") + console.property("width") * 0.7625
+            )
+            eye_center = eye.property("x") + eye.property("width") / 2
+            assert abs(eye_center - right_bay_center) <= 1.0
     finally:
         close_ui(qtbot, controller, engine, window)
 
