@@ -97,7 +97,7 @@ HAL follows XDG locations:
 ```text
 ~/.config/hal9000/config.json
 ~/.local/share/hal9000/
-~/.local/state/hal9000/hal9000.log
+~/.local/state/hal9000/logs/hal9000.log
 ~/.cache/hal9000/models/
 ```
 
