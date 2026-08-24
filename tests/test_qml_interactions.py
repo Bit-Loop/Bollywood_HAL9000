@@ -162,6 +162,78 @@ def test_required_responsive_sizes_keep_physical_components_in_bounds(qtbot, tmp
         close_ui(qtbot, controller, engine, window)
 
 
+def test_hal_chassis_spans_window_width_without_stretching_optics(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        console = window.findChild(QObject, "consoleFrame")
+        eye = window.findChild(QObject, "halEye")
+        assert console is not None and eye is not None
+
+        for width, height in ((600, 800), (800, 1000), (1080, 1920), (1280, 900)):
+            window.setWidth(width)
+            window.setHeight(height)
+            QTest.qWait(40)
+
+            assert console.property("width") >= width * 0.95
+            assert abs(eye.property("width") - eye.property("height")) <= 0.5
+            assert eye.property("width") <= min(
+                console.property("width"), console.property("height")
+            )
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_eye_and_speaker_animation_reuse_static_rendered_surfaces(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        eye = window.findChild(QObject, "halEye")
+        speaker = window.findChild(QObject, "speakerAssembly")
+        optics = window.findChild(QObject, "lensOpticsTexture")
+        grille = window.findChild(QObject, "speakerGrilleTexture")
+        assert all((eye, speaker, optics, grille))
+        qtbot.waitUntil(
+            lambda: optics.property("paintCount") > 0 and grille.property("paintCount") > 0,
+            timeout=1000,
+        )
+        optics_paints = optics.property("paintCount")
+        grille_paints = grille.property("paintCount")
+
+        eye.setProperty("active", True)
+        eye.setProperty("state", "THINKING")
+        speaker.setProperty("currentState", "SPEAKING")
+        for level in (0.15, 0.8, 0.3, 1.0, 0.0):
+            speaker.setProperty("speakerLevel", level)
+            QTest.qWait(45)
+
+        assert optics.property("paintCount") == optics_paints
+        assert grille.property("paintCount") == grille_paints
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_manual_drawer_geometry_transition_is_smooth_and_reversible(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        speaker = window.findChild(QObject, "speakerAssembly")
+        assert speaker is not None
+        closed_y = speaker.property("y")
+        open_y = window.property("height") * 0.49
+
+        controller.openManual()
+        QTest.qWait(75)
+        opening_y = speaker.property("y")
+        assert open_y < opening_y < closed_y
+        qtbot.waitUntil(lambda: abs(speaker.property("y") - open_y) < 1.0, timeout=800)
+
+        controller.closeManual()
+        QTest.qWait(75)
+        closing_y = speaker.property("y")
+        assert open_y < closing_y < closed_y
+        qtbot.waitUntil(lambda: abs(speaker.property("y") - closed_y) < 1.0, timeout=800)
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
 def test_hal_and_9000_are_centered_in_their_own_nameplate_fields(qtbot, tmp_path) -> None:
     controller, engine, window = build_ui(qtbot, tmp_path)
     try:

@@ -22,16 +22,33 @@ Item {
     Behavior on reveal {
         NumberAnimation {
             duration: 520 * Math.max(0.15, root.animationAmount)
-            easing.type: Easing.OutCubic
+            easing.type: Easing.InOutCubic
         }
     }
 
     Rectangle {
         anchors.fill: parent
-        color: "#090a0a"
-        border.width: Math.max(1, width * 0.004)
-        border.color: "#b9bab5"
         radius: Math.max(1, width * 0.004)
+        border.width: Math.max(1, width * 0.004)
+        border.color: "#d7d8d3"
+        gradient: Gradient {
+            orientation: Gradient.Horizontal
+            GradientStop { position: 0.00; color: "#303230" }
+            GradientStop { position: 0.025; color: "#d4d5d0" }
+            GradientStop { position: 0.065; color: "#71736f" }
+            GradientStop { position: 0.50; color: "#a9aba6" }
+            GradientStop { position: 0.94; color: "#666864" }
+            GradientStop { position: 0.98; color: "#e1e2dd" }
+            GradientStop { position: 1.00; color: "#282a29" }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: Math.max(4, root.width * 0.009)
+        color: "#080909"
+        border.width: 1
+        border.color: "#202220"
     }
 
     ManualDrawer {
@@ -40,7 +57,7 @@ Item {
             left: parent.left
             right: parent.right
             bottom: parent.bottom
-            margins: Math.max(5, parent.width * 0.012)
+            margins: Math.max(7, parent.width * 0.015)
         }
         height: Math.max(0, parent.height * 0.76 * root.reveal - 8)
         opacity: Math.max(0, (root.reveal - 0.15) / 0.85)
@@ -58,7 +75,7 @@ Item {
 
     Item {
         id: face
-        x: Math.max(5, root.width * 0.012)
+        x: Math.max(7, root.width * 0.015)
         y: x
         width: root.width - x * 2
         height: root.height - x * 2 - root.height * 0.73 * root.reveal
@@ -66,77 +83,44 @@ Item {
             origin.x: face.width / 2
             origin.y: 0
             axis { x: 1; y: 0; z: 0 }
-            angle: -6 * root.reveal * root.animationAmount
+            angle: -5 * root.reveal * root.animationAmount
         }
 
         Behavior on height {
             NumberAnimation {
                 duration: 520 * Math.max(0.15, root.animationAmount)
-                easing.type: Easing.OutCubic
+                easing.type: Easing.InOutCubic
             }
         }
 
-        Canvas {
-            id: grille
+        SpeakerGrille {
             anchors.fill: parent
-            property real meter: root.visualizationEnabled ? root.speakerLevel : 0.0
-            onMeterChanged: requestPaint()
-            onWidthChanged: requestPaint()
-            onHeightChanged: requestPaint()
-            onPaint: {
-                const ctx = getContext("2d")
-                ctx.reset()
-                const bg = ctx.createLinearGradient(0, 0, width, 0)
-                bg.addColorStop(0, "#656762")
-                bg.addColorStop(0.05, "#d2d3ce")
-                bg.addColorStop(0.24, "#9b9d98")
-                bg.addColorStop(0.52, "#d7d8d3")
-                bg.addColorStop(0.78, "#92948f")
-                bg.addColorStop(0.96, "#d6d7d2")
-                bg.addColorStop(1, "#5c5e5a")
-                ctx.fillStyle = bg
-                ctx.fillRect(0, 0, width, height)
-                ctx.strokeStyle = "#e2e3de"
-                ctx.lineWidth = Math.max(1, width * 0.003)
-                ctx.strokeRect(1, 1, width - 2, height - 2)
-
-                const marginX = Math.max(7, width * 0.025)
-                const marginY = Math.max(9, height * 0.07)
-                const gapX = Math.max(6, Math.min(11, width / 48))
-                const gapY = Math.max(6, Math.min(10, height / 22))
-                const radius = Math.max(1.1, Math.min(2.2, gapX * 0.22))
-                let row = 0
-                for (let y = marginY; y < height - marginY; y += gapY) {
-                    const offset = row % 2 ? gapX / 2 : 0
-                    for (let x = marginX + offset; x < width - marginX; x += gapX) {
-                        const position = 1 - y / Math.max(1, height)
-                        const active = root.visualizationEnabled && root.currentState === "SPEAKING"
-                                     && position < grille.meter * 0.82
-                        ctx.fillStyle = active ? "rgba(99,14,15,0.86)" : "#111212"
-                        ctx.beginPath(); ctx.ellipse(x, y, radius * 1.35, radius, 0, 0, Math.PI * 2); ctx.fill()
-                        ctx.strokeStyle = "rgba(255,255,250,0.38)"
-                        ctx.lineWidth = 0.5
-                        ctx.stroke()
-                    }
-                    row++
-                }
-            }
+            meter: root.visualizationEnabled ? root.speakerLevel : 0.0
+            energized: root.visualizationEnabled && root.currentState === "SPEAKING"
         }
 
         Rectangle {
             anchors { left: parent.left; right: parent.right; top: parent.top }
-            height: Math.max(4, parent.height * 0.025)
-            color: "#d0d1cc"
+            height: Math.max(4, parent.height * 0.026)
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: "#f3f3ee" }
+                GradientStop { position: 0.45; color: "#aaaca7" }
+                GradientStop { position: 1.0; color: "#484a48" }
+            }
             border.width: 1
-            border.color: "#50524f"
+            border.color: "#4c4e4b"
         }
 
         Rectangle {
             anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
-            height: Math.max(5, parent.height * 0.03)
-            color: "#b9bab5"
+            height: Math.max(5, parent.height * 0.034)
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: "#6a6c68" }
+                GradientStop { position: 0.55; color: "#c8c9c4" }
+                GradientStop { position: 1.0; color: "#4c4e4b" }
+            }
             border.width: 1
-            border.color: "#3b3d3b"
+            border.color: "#303230"
         }
 
         MouseArea {
@@ -148,15 +132,15 @@ Item {
     }
 
     Rectangle {
-        width: Math.min(84, root.width * 0.16)
+        width: Math.min(94, root.width * 0.17)
         height: 6
         anchors.horizontalCenter: parent.horizontalCenter
         y: face.y + face.height - 3
-        color: "#d0d1cc"
+        color: "#d9dad5"
         border.width: 1
         border.color: "#171817"
         radius: 1
-        opacity: 0.35 + root.reveal * 0.55
+        opacity: 0.34 + root.reveal * 0.58
         MouseArea {
             anchors.fill: parent
             anchors.margins: -12
@@ -171,11 +155,6 @@ Item {
         onClicked: mouse => mouse.accepted = true
     }
 
-    function focusPrompt() {
-        drawer.focusPrompt()
-    }
-
-    function submitPrompt() {
-        drawer.submit()
-    }
+    function focusPrompt() { drawer.focusPrompt() }
+    function submitPrompt() { drawer.submit() }
 }

@@ -18,6 +18,7 @@ ApplicationWindow {
     readonly property real animationAmount: controller.settingsSnapshot.appearance.animation_amount ?? 0.72
     readonly property real eyeBrightness: controller.settingsSnapshot.appearance.eye_brightness || 0.9
     readonly property bool speakerVisualization: controller.settingsSnapshot.appearance.speaker_visualization ?? true
+    readonly property real chassisMargin: Math.max(6, Math.min(width, height) * 0.014)
 
     Component.onCompleted: {
         controller.startup()
@@ -55,21 +56,18 @@ ApplicationWindow {
     MetalPanel { anchors.fill: parent; baseColor: "#050505" }
 
     Rectangle {
-        anchors.centerIn: consoleFrame
-        width: consoleFrame.width + Math.max(18, consoleFrame.width * 0.055)
-        height: consoleFrame.height + Math.max(18, consoleFrame.width * 0.055)
+        anchors.fill: consoleFrame
+        anchors.margins: -Math.max(5, window.chassisMargin * 0.65)
         color: "#000000"
-        opacity: 0.72
-        radius: 5
+        opacity: 0.82
+        radius: 7
     }
 
     Item {
         id: consoleFrame
         objectName: "consoleFrame"
-        width: Math.min(window.width * (window.portrait ? 0.67 : 0.42), window.height * 0.37)
-        height: window.height * (window.portrait ? 0.975 : 0.95)
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.verticalCenter: parent.verticalCenter
+        anchors.fill: parent
+        anchors.margins: window.chassisMargin
 
         Rectangle {
             anchors.fill: parent
@@ -79,11 +77,11 @@ ApplicationWindow {
             gradient: Gradient {
                 orientation: Gradient.Horizontal
                 GradientStop { position: 0.00; color: "#262827" }
-                GradientStop { position: 0.025; color: "#b8bab5" }
-                GradientStop { position: 0.065; color: "#4a4c49" }
-                GradientStop { position: 0.50; color: "#8d8f8a" }
-                GradientStop { position: 0.935; color: "#414340" }
-                GradientStop { position: 0.975; color: "#c7c8c3" }
+                GradientStop { position: 0.018; color: "#e0e1dc" }
+                GradientStop { position: 0.052; color: "#565956" }
+                GradientStop { position: 0.50; color: "#8f918c" }
+                GradientStop { position: 0.948; color: "#4c4f4c" }
+                GradientStop { position: 0.982; color: "#d7d8d3" }
                 GradientStop { position: 1.00; color: "#202221" }
             }
         }
@@ -91,10 +89,7 @@ ApplicationWindow {
         Rectangle {
             id: faceplate
             anchors.fill: parent
-            anchors.leftMargin: Math.max(7, parent.width * 0.026)
-            anchors.rightMargin: Math.max(7, parent.width * 0.026)
-            anchors.topMargin: Math.max(7, parent.width * 0.021)
-            anchors.bottomMargin: Math.max(7, parent.width * 0.021)
+            anchors.margins: Math.max(7, Math.min(parent.width, parent.height) * 0.018)
             color: "#080808"
             border.width: 1
             border.color: "#202120"
@@ -128,6 +123,28 @@ ApplicationWindow {
                 }
             }
 
+            Rectangle {
+                anchors { left: parent.left; right: parent.right; top: parent.top }
+                height: Math.max(1, parent.height * 0.002)
+                color: "#bfc1bc"
+                opacity: 0.22
+            }
+
+            Rectangle {
+                visible: !window.portrait
+                x: parent.width * 0.525
+                y: parent.height * 0.035
+                width: Math.max(1, parent.width * 0.0015)
+                height: parent.height * 0.91
+                gradient: Gradient {
+                    orientation: Gradient.Horizontal
+                    GradientStop { position: 0.0; color: "#111211" }
+                    GradientStop { position: 0.48; color: "#6a6c68" }
+                    GradientStop { position: 1.0; color: "#0a0b0a" }
+                }
+                opacity: 0.72
+            }
+
             MouseArea {
                 id: settingsContextArea
                 objectName: "settingsContextArea"
@@ -144,20 +161,31 @@ ApplicationWindow {
     HalHeader {
         id: header
         objectName: "halHeader"
-        x: consoleFrame.x + consoleFrame.width * 0.105
-        y: consoleFrame.y + consoleFrame.height * 0.028
-        width: consoleFrame.width * 0.79
-        height: consoleFrame.height * 0.072
+        x: consoleFrame.x + consoleFrame.width * (window.portrait ? 0.095 : 0.055)
+        y: consoleFrame.y + consoleFrame.height * (window.portrait ? 0.032 : 0.045)
+        width: consoleFrame.width * (window.portrait ? 0.81 : 0.46)
+        height: Math.min(
+                    consoleFrame.height * (window.portrait ? 0.078 : 0.105),
+                    width * 0.20
+                )
         scaleFactor: window.uiScale
+        active: controller.active
+        animationAmount: window.animationAmount
         z: 2
     }
 
     HalEye {
         id: eye
         objectName: "halEye"
-        x: consoleFrame.x + consoleFrame.width * 0.11
-        y: consoleFrame.y + consoleFrame.height * 0.335
-        width: consoleFrame.width * 0.78
+        readonly property real diameter: Math.min(
+                                                 consoleFrame.width * (window.portrait ? 0.72 : 0.38),
+                                                 consoleFrame.height * (window.portrait ? 0.46 : 0.60)
+                                             )
+        x: window.portrait
+           ? consoleFrame.x + (consoleFrame.width - width) / 2
+           : consoleFrame.x + consoleFrame.width * 0.585
+        y: consoleFrame.y + consoleFrame.height * (window.portrait ? 0.235 : 0.205)
+        width: diameter
         height: width
         active: controller.active
         state: controller.state
@@ -170,18 +198,10 @@ ApplicationWindow {
     SpeakerAssembly {
         id: speaker
         objectName: "speakerAssembly"
-        x: controller.manualOpen
-           ? window.width * (window.portrait ? 0.06 : 0.23)
-           : consoleFrame.x + consoleFrame.width * 0.055
-        y: controller.manualOpen
-           ? window.height * (window.portrait ? 0.49 : 0.25)
-           : consoleFrame.y + consoleFrame.height * 0.765
-        width: controller.manualOpen
-               ? window.width * (window.portrait ? 0.88 : 0.54)
-               : consoleFrame.width * 0.89
-        height: controller.manualOpen
-                ? window.height * (window.portrait ? 0.47 : 0.70)
-                : consoleFrame.height * 0.205
+        x: consoleFrame.x + consoleFrame.width * 0.055
+        y: consoleFrame.y + consoleFrame.height * (window.portrait ? 0.765 : 0.68)
+        width: consoleFrame.width * (window.portrait ? 0.89 : 0.46)
+        height: consoleFrame.height * (window.portrait ? 0.205 : 0.27)
         drawerOpen: controller.manualOpen
         speakerLevel: controller.speakerLevel
         visualizationEnabled: window.speakerVisualization
@@ -198,15 +218,35 @@ ApplicationWindow {
         onInteraction: controller.touchManual()
         z: 3
 
-        Behavior on x { enabled: controller.manualOpen; NumberAnimation { duration: 420 * Math.max(0.15, window.animationAmount); easing.type: Easing.OutCubic } }
-        Behavior on y { enabled: controller.manualOpen; NumberAnimation { duration: 420 * Math.max(0.15, window.animationAmount); easing.type: Easing.OutCubic } }
-        Behavior on width { enabled: controller.manualOpen; NumberAnimation { duration: 420 * Math.max(0.15, window.animationAmount); easing.type: Easing.OutCubic } }
-        Behavior on height { enabled: controller.manualOpen; NumberAnimation { duration: 420 * Math.max(0.15, window.animationAmount); easing.type: Easing.OutCubic } }
+        states: State {
+            name: "manual"
+            when: controller.manualOpen
+            PropertyChanges {
+                speaker.x: window.width * 0.06
+                speaker.y: window.height * (window.portrait ? 0.49 : 0.20)
+                speaker.width: window.width * 0.88
+                speaker.height: window.height * (window.portrait ? 0.47 : 0.74)
+            }
+        }
+
+        transitions: Transition {
+            from: ""
+            to: "manual"
+            reversible: true
+            NumberAnimation {
+                properties: "x,y,width,height"
+                duration: 460 * Math.max(0.15, window.animationAmount)
+                easing.type: Easing.InOutCubic
+            }
+        }
     }
 
     Text {
-        anchors.horizontalCenter: consoleFrame.horizontalCenter
-        y: consoleFrame.y + consoleFrame.height * 0.68
+        x: window.portrait
+           ? consoleFrame.x + (consoleFrame.width - width) / 2
+           : consoleFrame.x + consoleFrame.width * 0.055
+             + (consoleFrame.width * 0.46 - width) / 2
+        y: consoleFrame.y + consoleFrame.height * (window.portrait ? 0.70 : 0.57)
         text: controller.state === "STANDBY" ? "" : controller.state
         color: "#777872"
         font.family: HalTheme.controlFont
