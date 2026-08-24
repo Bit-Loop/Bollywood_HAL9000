@@ -25,6 +25,9 @@ dependencies = [
   "sentencepiece==0.2.2",
   "piper-tts==1.7.0",
   "keyring==25.7.0",
+  "datasketches==5.2.0",
+  "zstandard==0.25.0",
+  "mcp==2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +48,8 @@ package = ["build==1.3.0", "pyinstaller==6.16.0"]
 
 [project.scripts]
 hal9000 = "hal9000.app:main"
+hal-self-mcp = "hal9000.sentience.hermes.self_mcp_server:main"
+hal-self = "hal9000.sentience.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hal9000"]

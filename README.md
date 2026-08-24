@@ -36,6 +36,14 @@ double-click reopening it.
 - Atomic versioned XDG configuration, desktop-keyring storage for an optional
   remote Hermes token, managed model caches, rotating logs, and reversible XDG
   autostart.
+- A persistent four-plane machine self: transactional identity/capability/task
+  authority, bounded DataSketches interoception, compact causal memory, selected
+  content-addressed forensic evidence, and a token-bounded context compiler.
+  See [the architecture](docs/machine_self_architecture.md), [retention
+  contract](docs/storage_and_retention.md), [retrieval
+  contract](docs/retrieval_contract.md), [degradation state
+  machine](docs/degradation_behavior.md), and [measured load
+  results](docs/machine_self_benchmarks.md).
 
 Model weights are downloaded directly from their upstream repositories into
 the user cache and are not redistributed in this project. The XTTS cache is
@@ -80,6 +88,21 @@ Create wheel and source distributions with `./scripts/package.sh`. Remove the
 user installation with `./scripts/uninstall.sh`; add `--purge` only when you
 also intend to remove HAL configuration, state, logs, and cached model weights.
 
+Machine-self migrations run transactionally at desktop startup. They can also
+be operated without launching the UI:
+
+```bash
+hal-self migrate
+hal-self status
+hal-self integrity --full
+hal-self retention
+hal-self fts-rebuild
+```
+
+`retention` is a dry run unless `--apply` is supplied. Use `hal-self backup`
+before manual maintenance and `hal-self backups` to enumerate validated local
+recovery points.
+
 ## Controls
 
 - Double-click speaker grille: open the manual console.
@@ -122,6 +145,13 @@ Fast deterministic and UI suite:
 
 ```bash
 QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q -m 'not models'
+```
+
+Million-record storage/sketch load suite and standalone measured report:
+
+```bash
+QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q tests/load/test_storage_bloat.py
+.venv/bin/python scripts/benchmark_machine_self.py --count 1000000
 ```
 
 Downloaded-model inference suite:

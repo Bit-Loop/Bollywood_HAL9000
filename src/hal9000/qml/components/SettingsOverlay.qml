@@ -23,6 +23,27 @@ Rectangle {
             return name.toUpperCase() + " // " + passed + "/4 PASS // RTF " + worst.toFixed(2) + " // " + backend
         }).join("\n")
     }
+    function byteLabel(value) {
+        const bytes = Number(value || 0)
+        if (bytes >= 1073741824)
+            return (bytes / 1073741824).toFixed(2) + " GiB"
+        if (bytes >= 1048576)
+            return (bytes / 1048576).toFixed(1) + " MiB"
+        if (bytes >= 1024)
+            return (bytes / 1024).toFixed(1) + " KiB"
+        return bytes + " B"
+    }
+    function machineReport() {
+        return root.diagnostics.machineSelf || ({})
+    }
+    function dimensionLabel(name) {
+        const interoception = machineReport().interoception || ({})
+        const values = interoception.values || interoception
+        const item = values[name]
+        if (!item || item.value === null || item.value === undefined)
+            return "UNKNOWN"
+        return Number(item.value).toFixed(2) + (item.approximate ? " APPROX" : " EXACT")
+    }
     color: "#0c0d0d"
     border.width: 1
     border.color: "#555752"
@@ -525,7 +546,123 @@ Rectangle {
                 SettingRow { label: "STT"; Text { anchors.fill: parent; text: controller.sttStatus + " / " + controller.sttBackend; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
                 SettingRow { label: "XTTS / Piper"; Text { anchors.fill: parent; text: controller.xttsStatus + " / " + controller.piperStatus + " / " + controller.ttsEngine; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
                 SettingRow { label: "Compute"; Text { anchors.fill: parent; text: controller.cudaStatus; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight } }
+                SettingSection { title: "Machine self"; detail: "Exact control state first; bounded statistical awareness remains explicitly approximate." }
+                SettingRow {
+                    objectName: "machineCapabilityStatus"
+                    label: "Capability profile"
+                    Text {
+                        anchors.fill: parent
+                        property var rows: root.machineReport().capabilities || []
+                        property int readyCount: rows.filter(row => row.lifecycle_state === "READY").length
+                        text: rows.length ? readyCount + " / " + rows.length + " READY // EVIDENCE-AGED" : "RUN DIAGNOSTICS"
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Active task"
+                    Text {
+                        anchors.fill: parent
+                        property var task: root.machineReport().active_task
+                        property var missing: (root.machineReport().task_requirements || []).filter(row => row.lifecycle_state !== row.minimum_state)
+                        text: task ? task.state.toUpperCase() + " // " + missing.length + " UNMET // " + task.title : "IDLE"
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    objectName: "machineDegradationStatus"
+                    label: "Degradation"
+                    Text {
+                        anchors.fill: parent
+                        property var episode: root.machineReport().degradation || ({})
+                        text: String(episode.state || "unknown").toUpperCase()
+                              + (episode.severity ? " // " + String(episode.severity).toUpperCase() : "")
+                              + ((episode.lost_capabilities || []).length ? " // " + episode.lost_capabilities.join(", ") : "")
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Recovery / revalidation"
+                    Text {
+                        anchors.fill: parent
+                        property var episode: root.machineReport().degradation || ({})
+                        text: episode.recovery_seconds_remaining === null || episode.recovery_seconds_remaining === undefined
+                              ? Number((episode.conclusions_requiring_revalidation || []).length) + " CONCLUSIONS PENDING"
+                              : Number(episode.recovery_seconds_remaining).toFixed(0) + " s STABILITY // "
+                                + Number((episode.conclusions_requiring_revalidation || []).length) + " REVALIDATE"
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Interoception"
+                    Text {
+                        anchors.fill: parent
+                        text: "CAP " + root.dimensionLabel("cognitive_capacity")
+                              + " // CONTEXT " + root.dimensionLabel("context_pressure")
+                              + " // ANOMALY " + root.dimensionLabel("anomaly_pressure")
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 8; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    objectName: "machineStorageStatus"
+                    label: "Bounded storage"
+                    Text {
+                        anchors.fill: parent
+                        property var storage: root.machineReport().storage || ({})
+                        text: root.byteLabel(storage.total_bytes) + " / " + root.byteLabel(storage.budget_bytes)
+                              + " // " + String(storage.pressure || "unknown").toUpperCase()
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Integrity"
+                    Text {
+                        anchors.fill: parent
+                        property var report: root.machineReport().integrity || ({})
+                        text: "DB " + (report.database_valid ? "PASS" : "UNKNOWN/FAIL")
+                              + " // CHAIN " + (report.control_chain_valid ? "PASS" : "UNKNOWN/FAIL")
+                              + " // FTS " + (report.fts_valid ? "PASS" : "UNKNOWN/FAIL")
+                              + " // BLOBS MISSING " + Number(report.missing_blobs || 0)
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 8; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Context / sketches"
+                    Text {
+                        anchors.fill: parent
+                        property var capsule: root.machineReport().context_capsule || ({})
+                        text: Number(capsule.tokens || 0) + " / " + Number(capsule.budget_tokens || 0)
+                              + " TOKENS // " + Number((root.machineReport().sketches || []).length) + " BUCKETS"
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Latest sketch"
+                    Text {
+                        anchors.fill: parent
+                        property var rows: root.machineReport().sketches || []
+                        property var item: rows.length ? rows[0] : null
+                        text: item ? String(item.metric_name).toUpperCase() + " // " + String(item.mode)
+                                     + " // " + (item.estimate === null || item.estimate === undefined
+                                                  ? "UNKNOWN" : Number(item.estimate).toFixed(1))
+                                     + (item.lower_bound === null ? "" : " [" + Number(item.lower_bound).toFixed(1)
+                                        + ", " + Number(item.upper_bound).toFixed(1) + "]") : "NO ACTIVE BUCKETS"
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 8; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
+                    label: "Maintenance / recent"
+                    Text {
+                        anchors.fill: parent
+                        property var maintenance: root.machineReport().maintenance || ({})
+                        property var events: root.machineReport().recent_exact_events || []
+                        text: Number(maintenance.compaction_jobs || 0) + " COMPACTIONS // "
+                              + Number(maintenance.retention_tombstones || 0) + " TOMBSTONES // "
+                              + (events.length ? String(events[0].type).toUpperCase() : "NO EVENTS")
+                        color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 8; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                    }
+                }
                 HalButton { width: Math.min(260, parent.width); text: root.diagnostics.status === "running" ? "RUNNING…" : "RUN DIAGNOSTICS"; enabled: root.diagnostics.status !== "running"; onClicked: controller.runDiagnostics() }
+                HalButton { width: Math.min(260, parent.width); text: "EXPORT REDACTED REPORT"; enabled: Object.keys(root.machineReport()).length > 0; onClicked: controller.exportMachineSelfReport() }
                 Repeater {
                     model: root.diagnostics.checks || []
                     delegate: Row {

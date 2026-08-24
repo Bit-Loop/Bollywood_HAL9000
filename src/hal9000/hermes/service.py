@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+import hashlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from hal9000.hermes.discovery import (
     probe_backend,
 )
 from hal9000.hermes.process import HermesProcessManager
+from hal9000.sentience.hermes.gateway_adapter import SelfMcpRegistration
+from hal9000.sentience.events.redact import redact_text
 
 
 class HermesService(QObject):
@@ -41,6 +44,7 @@ class HermesService(QObject):
     modelChanged = Signal(str, str)
     reasoningChanged = Signal(str)
     modelOperationError = Signal(str)
+    structuredEvent = Signal(dict)
     _probeFinished = Signal(object)
 
     def __init__(
@@ -81,6 +85,10 @@ class HermesService(QObject):
         self._desired_reasoning = settings.reasoning_effort
         self._preferences_pending = False
         self._preferences_failed = False
+        self._self_mcp_enabled = False
+        self._self_mcp = SelfMcpRegistration()
+        self._self_mcp_request = ""
+        self._self_mcp_stage = "idle"
         self._probe_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hal9000-hermes-probe"
         )
@@ -153,7 +161,11 @@ class HermesService(QObject):
         self._preferences_failed = False
         self._model_switch_requests.clear()
         self._reasoning_requests.clear()
-        self._queued_prompt = ""
+        if self._queued_prompt:
+            self._emit_undelivered(self._queued_prompt, "Hermes service stopped before delivery")
+            self._queued_prompt = ""
+        self._self_mcp_stage = "idle"
+        self._self_mcp_request = ""
         self.client.close()
         if self.process is not None:
             self.process.stop()
@@ -165,6 +177,10 @@ class HermesService(QObject):
 
     def set_token(self, token: str) -> None:
         self._token = token.strip()
+
+    def enableSelfMcp(self) -> None:
+        """Install HAL's narrow MCP server through Hermes' supported RPCs."""
+        self._self_mcp_enabled = True
 
     def apply_settings(self) -> None:
         was_running = self._want_running
@@ -195,6 +211,11 @@ class HermesService(QObject):
             )
             return
         if not self._runtime_session_id or self._preferences_pending:
+            if self._queued_prompt and self._queued_prompt != clean:
+                self._emit_undelivered(
+                    self._queued_prompt,
+                    "a newer bounded pending prompt replaced it",
+                )
             self._queued_prompt = clean
             if self.client.connected and not self._runtime_session_id:
                 self._create_or_resume_session()
@@ -208,6 +229,8 @@ class HermesService(QObject):
 
     @Slot()
     def cancel(self) -> None:
+        if self._queued_prompt:
+            self._emit_undelivered(self._queued_prompt, "user cancelled before delivery")
         self._queued_prompt = ""
         if self._runtime_session_id:
             self.client.request(
@@ -415,7 +438,43 @@ class HermesService(QObject):
         self._set_status(state_map.get(state, state))
         if state == "connected":
             self._restart_attempts = 0
-            self._create_or_resume_session()
+            if self._self_mcp_enabled:
+                if self._self_mcp_stage == "ready":
+                    self._create_or_resume_session()
+                else:
+                    self._ensure_self_mcp()
+            else:
+                self._create_or_resume_session()
+
+    def _ensure_self_mcp(self) -> None:
+        if self._self_mcp_stage not in {"idle", "failed"}:
+            return
+        self._self_mcp_stage = "listing"
+        self._self_mcp_request = self.client.request(
+            "mcp.servers.list",
+            **({"params": {"profile": self.settings.profile}} if self.settings.profile else {}),
+            timeout_ms=30_000,
+        )
+
+    def _request_self_mcp_add(self) -> None:
+        self._self_mcp_stage = "adding"
+        self._self_mcp_request = self.client.request(
+            "mcp.servers.add",
+            self._self_mcp.add_params(profile=self.settings.profile),
+            60_000,
+        )
+
+    def _request_self_mcp_test(self) -> None:
+        self._self_mcp_stage = "testing"
+        params = {"name": self._self_mcp.name}
+        if self.settings.profile:
+            params["profile"] = self.settings.profile
+        self._self_mcp_request = self.client.request("mcp.servers.test", params, 60_000)
+
+    def _finish_self_mcp_setup(self) -> None:
+        self._self_mcp_stage = "ready"
+        self._self_mcp_request = ""
+        self._create_or_resume_session()
 
     def _create_or_resume_session(self) -> None:
         if self._stored_session_id:
@@ -438,7 +497,36 @@ class HermesService(QObject):
 
     def _on_rpc_result(self, request_id: str, method: str, result: Any) -> None:
         payload = result if isinstance(result, dict) else {}
-        if method in {"session.create", "session.resume"}:
+        if request_id == self._self_mcp_request and method == "mcp.servers.list":
+            servers = [item for item in payload.get("servers") or [] if isinstance(item, dict)]
+            existing = next(
+                (item for item in servers if str(item.get("name") or "") == self._self_mcp.name),
+                None,
+            )
+            if existing is None:
+                self._request_self_mcp_add()
+            elif self._self_mcp.matches(existing):
+                self._request_self_mcp_test()
+            else:
+                self._self_mcp_stage = "removing"
+                params = {"name": self._self_mcp.name}
+                if self.settings.profile:
+                    params["profile"] = self.settings.profile
+                self._self_mcp_request = self.client.request(
+                    "mcp.servers.remove", params, 30_000
+                )
+        elif request_id == self._self_mcp_request and method == "mcp.servers.remove":
+            self._request_self_mcp_add()
+        elif request_id == self._self_mcp_request and method == "mcp.servers.add":
+            self._request_self_mcp_test()
+        elif request_id == self._self_mcp_request and method == "mcp.servers.test":
+            if not bool(payload.get("ok")):
+                self.errorOccurred.emit(
+                    "HAL self MCP failed its Hermes probe: "
+                    + str(payload.get("error") or "unknown error")
+                )
+            self._finish_self_mcp_setup()
+        elif method in {"session.create", "session.resume"}:
             self._runtime_session_id = str(payload.get("session_id") or "")
             self._stored_session_id = str(
                 payload.get("stored_session_id") or payload.get("session_key") or self._stored_session_id
@@ -501,6 +589,12 @@ class HermesService(QObject):
     def _on_rpc_error(
         self, request_id: str, method: str, message: str, _code: int
     ) -> None:
+        if request_id == self._self_mcp_request and method.startswith("mcp.servers."):
+            self._self_mcp_stage = "failed"
+            self._self_mcp_request = ""
+            self.errorOccurred.emit(f"HAL self MCP registration failed: {message}")
+            self._create_or_resume_session()
+            return
         if method == "session.resume" and self._stored_session_id:
             self._stored_session_id = ""
             self._runtime_session_id = ""
@@ -543,6 +637,10 @@ class HermesService(QObject):
         if queued and deliver_queued:
             self.sendPrompt(queued)
         elif queued:
+            self._emit_undelivered(
+                queued,
+                failure or "required Hermes session model could not be applied",
+            )
             self.errorOccurred.emit(
                 "HAL did not send the prompt because its Hermes session model "
                 f"could not be applied: {failure or 'unknown model error'}"
@@ -555,11 +653,27 @@ class HermesService(QObject):
             failure=message,
         )
 
+    def _emit_undelivered(self, prompt: str, reason: str) -> None:
+        encoded = redact_text(prompt).encode("utf-8")
+        self.structuredEvent.emit(
+            {
+                "type": "hal.prompt.undelivered",
+                "session_id": self._runtime_session_id or self._stored_session_id,
+                "payload": {
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "bytes": len(encoded),
+                    "reason": reason[:1000],
+                    "prompt_retained": False,
+                },
+            }
+        )
+
     def _on_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
         session_id = str(event.get("session_id") or "")
         if session_id and self._runtime_session_id and session_id != self._runtime_session_id:
             return
+        self.structuredEvent.emit(dict(event))
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         if event_type == "session.info":
             tools = payload.get("tools") if isinstance(payload.get("tools"), dict) else {}

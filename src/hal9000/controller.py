@@ -29,6 +29,9 @@ from hal9000.speech.text import SpeechChunker
 from hal9000.speech.tts.manager import TtsManager
 from hal9000.speech.wake_service import WakeWordService
 from hal9000.state import HalState, HalStateMachine, InvalidTransition
+from hal9000.sentience.service import MachineSelfService, PreparedPrompt
+from hal9000.sentience.diagnostics.export import export_support_report
+from hal9000.sentience.memory.evidence import FirstPersonTruthContract
 
 
 class HalController(QObject):
@@ -51,6 +54,9 @@ class HalController(QObject):
     recentErrorsChanged = Signal()
     hermesModelsChanged = Signal()
     _cudaDetected = Signal(str)
+    _machinePromptResult = Signal(object)
+    _machineDiagnosticsReady = Signal(object)
+    _machineCriticalStop = Signal(str)
 
     def __init__(
         self,
@@ -78,6 +84,9 @@ class HalController(QObject):
         self.secret_store = SecretStore()
         self._hermes_token = self.secret_store.get_hermes_token()
         self.hermes = HermesService(config.hermes, cwd, self._hermes_token, self)
+        self.machine_self = MachineSelfService(paths, config, cwd)
+        if config.sentience.enabled:
+            self.hermes.enableSelfMcp()
         self.audio = AudioCoordinator(config.stt, self)
         self.wake = WakeWordService(
             config.wake.phrase,
@@ -111,6 +120,7 @@ class HalController(QObject):
         self._first_run = not config.general.setup_complete
         self._setup_in_progress = False
         self._diagnostics: dict[str, Any] = {}
+        self._machine_diagnostics: dict[str, Any] = {}
         self._assistant_row = -1
         self._assistant_text = ""
         self._assistant_received_delta = False
@@ -121,9 +131,13 @@ class HalController(QObject):
         self._speech_pending = 0
         self._speech_turn_finished = True
         self._speech_suppressed = False
+        self._speech_guarded_chunks: list[str] = []
+        self._active_machine_task_id: str | None = None
+        self._machine_stop_task_id = ""
         self._voice_conversation = False
         self._capture_origin = ""
         self._startup_complete = False
+        self._shutdown_complete = False
         self._services_enabled = services_enabled
         self._integrations: list[str] = []
         self._model_task = ""
@@ -136,8 +150,14 @@ class HalController(QObject):
         self._manual_idle_timer = QTimer(self)
         self._manual_idle_timer.setSingleShot(True)
         self._manual_idle_timer.timeout.connect(self._manual_idle_timeout)
+        self._machine_outbox_timer = QTimer(self)
+        self._machine_outbox_timer.setInterval(250)
+        self._machine_outbox_timer.timeout.connect(self._dispatch_machine_outbox)
         self._scheduled_timers: set[QTimer] = set()
         self._cudaDetected.connect(self._set_cuda_status)
+        self._machinePromptResult.connect(self._machine_prompt_result)
+        self._machineDiagnosticsReady.connect(self._machine_diagnostics_ready)
+        self._machineCriticalStop.connect(self._stop_for_machine_degradation)
         self._connect_signals()
 
     def _connect_signals(self) -> None:
@@ -157,6 +177,7 @@ class HalController(QObject):
         self.hermes.toolActivity.connect(self._tool_activity)
         self.hermes.approvalRequested.connect(self._approval_requested)
         self.hermes.errorOccurred.connect(self._error)
+        self.hermes.structuredEvent.connect(self._machine_hermes_event)
         self.audio.levelChanged.connect(self._set_mic_level)
         self.audio.wakeDetected.connect(self._wake_detected)
         self.audio.utteranceReady.connect(self._utterance_ready)
@@ -342,6 +363,12 @@ class HalController(QObject):
         if not self._services_enabled:
             self._schedule(100, self._finish_boot)
             return
+        try:
+            self.machine_self.start()
+            self._machine_outbox_timer.start()
+        except Exception as exc:
+            self._record_error(f"Machine self: {exc}")
+            self.notification.emit("HAL machine-self persistence is unavailable; typed operation remains available")
         self.audio_devices.refresh()
         threading.Thread(
             target=self._detect_cuda,
@@ -359,6 +386,10 @@ class HalController(QObject):
 
     @Slot()
     def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        self._machine_outbox_timer.stop()
         for timer in tuple(self._scheduled_timers):
             timer.stop()
             timer.deleteLater()
@@ -370,6 +401,7 @@ class HalController(QObject):
         self.stt.close()
         self.tts.close()
         self.diagnostics_runner.close()
+        self.machine_self.stop()
 
     @Slot()
     def speakerClick(self) -> None:
@@ -432,6 +464,9 @@ class HalController(QObject):
         self._assistant_received_delta = False
         self._assistant_segment_text = ""
         self._assistant_interim_texts.clear()
+        self._speech_guarded_chunks.clear()
+        self._active_machine_task_id = None
+        self._machine_stop_task_id = ""
         self.touchManual()
         if not self.manualOpen and self._capture_origin != "wake":
             self.openManual()
@@ -439,9 +474,93 @@ class HalController(QObject):
         self._assistant_row = -1
         self._assistant_text = ""
         self._transition(HalState.THINKING, "prompt submitted")
-        self.hermes.sendPrompt(
-            prompt_with_location(clean, self.config.general.zip_code)
+        outgoing = prompt_with_location(clean, self.config.general.zip_code)
+        if self.machine_self.database is None:
+            self.hermes.sendPrompt(outgoing)
+            return
+        future = self.machine_self.prepare_prompt_async(
+            outgoing,
+            session_id=self.hermes.sessionId,
+            voice=self._voice_conversation,
+            user_text=clean,
         )
+
+        def completed(result, fallback=outgoing) -> None:
+            try:
+                self._machinePromptResult.emit((result.result(), "", fallback))
+            except Exception as exc:
+                self._machinePromptResult.emit((None, str(exc), fallback))
+
+        future.add_done_callback(completed)
+
+    @Slot(object)
+    def _machine_prompt_result(self, payload: object) -> None:
+        prepared, error, fallback = payload if isinstance(payload, tuple) else (None, "invalid result", "")
+        if isinstance(prepared, PreparedPrompt):
+            self._active_machine_task_id = prepared.task_id
+            self.hermes.sendPrompt(prepared.text)
+            return
+        if error:
+            self._record_error("Machine self context: " + str(error))
+            self.notification.emit("HAL could not compile persisted context for this turn")
+        if fallback:
+            self.hermes.sendPrompt(str(fallback))
+
+    @Slot(dict)
+    def _machine_hermes_event(self, event: dict[str, Any]) -> None:
+        future = self.machine_self.observe_hermes_event(event)
+        if future is not None:
+            future.add_done_callback(self._machine_background_done)
+
+    def _machine_background_done(self, future: object) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logging.getLogger("hal9000.machine_self").error(
+                "Machine-self event projection failed: %s", exc
+            )
+            return
+        task_id = self._active_machine_task_id
+        if self.machine_self.task_requires_checkpoint_stop(task_id):
+            self._machineCriticalStop.emit(str(task_id))
+
+    @Slot(str)
+    def _stop_for_machine_degradation(self, task_id: str) -> None:
+        if not task_id or task_id != self._active_machine_task_id:
+            return
+        if task_id == self._machine_stop_task_id:
+            return
+        self._machine_stop_task_id = task_id
+        self._cancel_speech_output(suppress=True)
+        self.hermes.cancel()
+        self.notification.emit(
+            "HAL checkpointed this task because an exact required capability was lost"
+        )
+        self._transition(
+            HalState.ERROR,
+            "critical machine-self capability loss requires checkpoint and stop",
+        )
+
+    def _dispatch_machine_outbox(self) -> None:
+        if self.machine_self.database is None:
+            return
+        try:
+            self.machine_self.dispatch_outbox(
+                tts_available=self.tts.status != "error",
+                speak=self._speak_machine_phrase,
+                display=self._display_machine_phrase,
+            )
+        except Exception as exc:
+            self._record_error("Machine-self outbox: " + str(exc))
+
+    def _display_machine_phrase(self, text: str) -> None:
+        self._append_message("assistant", text)
+
+    def _speak_machine_phrase(self, text: str) -> None:
+        # Transcript evidence guarantees one visible emission even if the
+        # asynchronous audio backend fails after accepting the phrase.
+        self._display_machine_phrase(text)
+        self.tts.speak(text)
 
     @Slot()
     def toggleManualMic(self) -> None:
@@ -520,6 +639,9 @@ class HalController(QObject):
 
     @Slot()
     def stopHermes(self) -> None:
+        self.machine_self.set_gateway_connected(
+            False, session_id=self.hermes.sessionId, expected=True
+        )
         self.hermes.stop()
 
     @Slot()
@@ -532,6 +654,7 @@ class HalController(QObject):
 
     @Slot(str, str)
     def selectHermesModel(self, provider: str, model: str) -> None:
+        self.machine_self.expect_model_selection(provider, model)
         self.hermes.switchModel(provider, model)
 
     @Slot(str)
@@ -597,6 +720,7 @@ class HalController(QObject):
     @Slot()
     def runDiagnostics(self) -> None:
         self._diagnostics = {"status": "running", "checks": []}
+        self._machine_diagnostics = {}
         self.diagnosticsChanged.emit()
         self.diagnostics_runner.run(
             {
@@ -613,6 +737,15 @@ class HalController(QObject):
                 "recentErrors": list(self._recent_errors),
             }
         )
+        future = self.machine_self.diagnostics_async()
+        if future is not None:
+            def completed(result) -> None:
+                try:
+                    self._machineDiagnosticsReady.emit(result.result())
+                except Exception as exc:
+                    self._machineDiagnosticsReady.emit({"error": str(exc)})
+
+            future.add_done_callback(completed)
 
     @Slot(str, "QVariant")
     def updateSetting(self, dotted: str, value: object) -> None:
@@ -651,6 +784,12 @@ class HalController(QObject):
     @Slot(str, str)
     def respondApproval(self, request_id: str, choice: str) -> None:
         self.touchManual()
+        if not self.machine_self.can_authorize_consequential:
+            choice = "deny"
+            self.notification.emit(
+                "Approval denied because HAL cannot verify machine-self continuity"
+            )
+        self.machine_self.resolve_approval(request_id, choice)
         self.hermes.respondApproval(request_id, choice)
         for index, item in enumerate(self.approvals.snapshot()):
             if item.get("requestId") == request_id:
@@ -662,6 +801,22 @@ class HalController(QObject):
         path = self.paths.log_file if kind == "logs" else self.paths.config_file
         path.parent.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    @Slot()
+    def exportMachineSelfReport(self) -> None:
+        if not self._machine_diagnostics:
+            self.notification.emit("Run diagnostics before exporting the machine-self report")
+            return
+        try:
+            destination = export_support_report(
+                self._machine_diagnostics,
+                self.paths.logs / "hal-machine-self-support.json",
+            )
+        except Exception as exc:
+            self._record_error("Machine-self report export: " + str(exc))
+            self.notification.emit("Machine-self support report export failed")
+            return
+        self.notification.emit(f"Redacted machine-self report saved to {destination}")
 
     def _finish_boot(self) -> None:
         if self.state_machine.current == HalState.BOOTING:
@@ -675,6 +830,13 @@ class HalController(QObject):
     def _wake_ready(self, engine: object) -> None:
         self.audio.set_wake_engine(engine)
         self.audio.start(self.config.wake.input_device or self.config.stt.input_device)
+        self.machine_self.update_capability(
+            "microphone",
+            True,
+            reason="wake/audio capture pipeline reports ready",
+            evidence={"wake_engine": type(engine).__name__},
+            expected=not self._startup_complete,
+        )
         self.subsystemChanged.emit()
 
     def _wake_detected(self) -> None:
@@ -712,6 +874,11 @@ class HalController(QObject):
             self._voice_conversation = False
             self.state_machine.return_to_rest("empty transcription")
             return
+        future = self.machine_self.record_audio_transcript_async(
+            clean, session_id=self.hermes.sessionId
+        )
+        if future is not None:
+            future.add_done_callback(self._machine_background_done)
         self.sendText(clean)
 
     def _assistant_started(self, _message_id: str) -> None:
@@ -725,6 +892,7 @@ class HalController(QObject):
         self._assistant_complete_received = False
         self._speech_turn_finished = False
         self._speech_suppressed = False
+        self._speech_guarded_chunks.clear()
         self._assistant_text = ""
         self._assistant_row = self._append_message("assistant", "", streaming=True)
         if self.state_machine.current == HalState.STANDBY:
@@ -736,9 +904,18 @@ class HalController(QObject):
         self._assistant_text += delta
         self._assistant_segment_text += delta
         self._assistant_received_delta = True
+        visible = self._assistant_text
+        if visible and self.machine_self.database is not None:
+            try:
+                visible = self.machine_self.preview_output(
+                    visible, task_id=self._active_machine_task_id
+                ).text
+            except Exception as exc:
+                self._record_error("Machine-self streaming truth contract: " + str(exc))
+                visible = "The current response cannot be verified yet."
         self.conversations.update(
             self._assistant_row,
-            {"text": self._assistant_text, "streaming": True},
+            {"text": visible, "streaming": True},
         )
         self._queue_speech_chunks(self._speech_chunker.feed(delta))
 
@@ -765,15 +942,32 @@ class HalController(QObject):
         self._queue_speech_chunks(self._speech_chunker.finish())
         self._assistant_interim_texts.append(authoritative)
         self._assistant_segment_text = ""
+        visible = self._assistant_text or authoritative
+        if visible and self.machine_self.database is not None:
+            try:
+                visible = self.machine_self.preview_output(
+                    visible, task_id=self._active_machine_task_id
+                ).text
+            except Exception as exc:
+                self._record_error("Machine-self interim truth contract: " + str(exc))
+                visible = "The current response cannot be verified yet."
         self.conversations.update(
             self._assistant_row,
-            {"text": self._assistant_text or authoritative, "streaming": True},
+            {"text": visible, "streaming": True},
         )
 
     def _assistant_completed(self, text: str, response_previewed: bool = False) -> None:
         streamed = self._assistant_text
         current_segment = self._assistant_segment_text.strip()
-        final = text.strip() or streamed.strip()
+        raw_final = text.strip() or streamed.strip()
+        final = raw_final
+        if final and self.machine_self.database is not None:
+            try:
+                final = self.machine_self.enforce_output(
+                    final, task_id=self._active_machine_task_id
+                ).text
+            except Exception as exc:
+                self._record_error("Machine-self truth contract: " + str(exc))
         if self._assistant_row < 0:
             self._assistant_row = self._append_message("assistant", final)
         else:
@@ -782,19 +976,20 @@ class HalController(QObject):
                 {"text": final, "streaming": False},
         )
         self._assistant_text = final
-        final_was_interim = final in self._assistant_interim_texts
-        if final and not response_previewed and not final_was_interim:
+        final_was_interim = raw_final in self._assistant_interim_texts
+        if raw_final and not response_previewed and not final_was_interim:
             if not current_segment:
-                self._queue_speech_chunks(self._speech_chunker.feed(final))
-            elif final.startswith(current_segment):
+                self._queue_speech_chunks(self._speech_chunker.feed(raw_final))
+            elif raw_final.startswith(current_segment):
                 self._queue_speech_chunks(
-                    self._speech_chunker.feed(final[len(current_segment) :])
+                    self._speech_chunker.feed(raw_final[len(current_segment) :])
                 )
-            elif final != current_segment:
+            elif raw_final != current_segment:
                 self._queue_speech_chunks(self._speech_chunker.finish())
                 self._speech_chunker.reset()
-                self._queue_speech_chunks(self._speech_chunker.feed(final))
+                self._queue_speech_chunks(self._speech_chunker.feed(raw_final))
         self._queue_speech_chunks(self._speech_chunker.finish())
+        self._flush_guarded_speech()
         self._assistant_segment_text = ""
         self._assistant_complete_received = True
         self._maybe_finish_speech()
@@ -807,6 +1002,15 @@ class HalController(QObject):
             or event.get("display_name")
             or "Hermes tool"
         )
+        if (
+            event_type == "tool.start"
+            and not self.machine_self.can_authorize_consequential
+            and self.machine_self.is_consequential_tool(name)
+        ):
+            self.hermes.cancel()
+            self.notification.emit(
+                "Consequential tool execution stopped because continuity is not verified"
+            )
         activity_id = str(
             event.get("tool_id") or event.get("tool_call_id") or event.get("id") or name
         )
@@ -869,8 +1073,28 @@ class HalController(QObject):
             clean = chunk.strip()
             if not clean:
                 continue
+            if FirstPersonTruthContract.claim_kinds(clean):
+                self._speech_guarded_chunks.append(clean)
+                continue
             self._speech_pending += 1
             self.tts.speak(clean)
+
+    def _flush_guarded_speech(self) -> None:
+        guarded = tuple(self._speech_guarded_chunks)
+        self._speech_guarded_chunks.clear()
+        for chunk in guarded:
+            clean = chunk
+            if self.machine_self.database is not None:
+                try:
+                    clean = self.machine_self.enforce_output(
+                        chunk, task_id=self._active_machine_task_id
+                    ).text
+                except Exception as exc:
+                    self._record_error("Machine-self speech truth contract: " + str(exc))
+                    continue
+            if clean.strip():
+                self._speech_pending += 1
+                self.tts.speak(clean.strip())
 
     def _maybe_finish_speech(self) -> None:
         if (
@@ -894,6 +1118,7 @@ class HalController(QObject):
         self._assistant_complete_received = True
         self._speech_pending = 0
         self._speech_chunker.reset()
+        self._speech_guarded_chunks.clear()
         self.tts.cancelPending()
         self.playback.stop()
         self.audio.setSpeaking(False)
@@ -921,6 +1146,13 @@ class HalController(QObject):
         logging.getLogger("hal9000.tts").info("%s", reason)
         self.config.voice.last_fallback_reason = reason
         self._save_config()
+        self.machine_self.update_capability(
+            "speech",
+            True,
+            reason="voice engine fallback retained speech output",
+            evidence={"fallback": reason, "engine": "Piper"},
+            expected=True,
+        )
         self.subsystemChanged.emit()
 
     def _tts_engine_changed(self, engine: str) -> None:
@@ -929,6 +1161,13 @@ class HalController(QObject):
             self.config.voice.last_fallback_reason = ""
             self._save_config()
             self.configChanged.emit()
+        self.machine_self.update_capability(
+            "speech",
+            bool(engine),
+            reason="TTS manager reported its active engine",
+            evidence={"engine": engine},
+            expected=True,
+        )
         self.subsystemChanged.emit()
 
     def _error(self, message: str) -> None:
@@ -940,6 +1179,12 @@ class HalController(QObject):
     def _audio_error(self, message: str) -> None:
         self._record_error(message)
         self.notification.emit(message + " — typed mode remains available")
+        self.machine_self.update_capability(
+            "microphone",
+            False,
+            reason="audio capture reported an error",
+            evidence={"error": message},
+        )
         self.subsystemChanged.emit()
 
     def _wake_error(self, message: str) -> None:
@@ -961,6 +1206,12 @@ class HalController(QObject):
         self._speech_turn_finished = True
         self.playback.stop()
         self.audio.setSpeaking(False)
+        self.machine_self.update_capability(
+            "speech",
+            False,
+            reason="TTS manager reported speech output unavailable",
+            evidence={"error": message},
+        )
         self.state_machine.return_to_rest("TTS failure; text retained")
         if self._setup_in_progress:
             self._complete_first_run()
@@ -978,7 +1229,13 @@ class HalController(QObject):
         self.speakerLevelChanged.emit(value)
 
     def _diagnostics_complete(self, report: dict) -> None:
-        self._diagnostics = report
+        self._diagnostics = {**report, "machineSelf": dict(self._machine_diagnostics)}
+        self.diagnosticsChanged.emit()
+
+    @Slot(object)
+    def _machine_diagnostics_ready(self, report: object) -> None:
+        self._machine_diagnostics = dict(report) if isinstance(report, dict) else {"error": "invalid report"}
+        self._diagnostics = {**self._diagnostics, "machineSelf": dict(self._machine_diagnostics)}
         self.diagnosticsChanged.emit()
 
     def _set_integrations(self, integrations: list[str]) -> None:
@@ -1067,6 +1324,18 @@ class HalController(QObject):
 
     def _hermes_status_changed(self, status: str) -> None:
         self.subsystemChanged.emit()
+        if not self._shutdown_complete and status in {
+            "connected",
+            "offline",
+            "error",
+            "reconnecting",
+            "restarting",
+        }:
+            future = self.machine_self.set_gateway_connected(
+                status == "connected", session_id=self.hermes.sessionId
+            )
+            if future is not None:
+                future.add_done_callback(self._machine_background_done)
         if status == "connected" and self.state_machine.current == HalState.ERROR:
             self.state_machine.return_to_rest("Hermes reconnected")
 

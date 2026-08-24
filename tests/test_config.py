@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 
 from hal9000.config import AppConfig, ConfigStore
 from hal9000.paths import AppPaths
@@ -51,7 +52,9 @@ def test_configuration_round_trip_and_atomic_replace(tmp_path) -> None:
     assert restored.wake.phrase == "hey hal"
     assert restored.voice.benchmark_results["XTTS"][0]["synthesized"] is True
     assert not list(paths.config.glob("*.tmp"))
-    assert json.loads(paths.config_file.read_text())["version"] == 3
+    assert json.loads(paths.config_file.read_text())["version"] == 4
+    assert stat.S_IMODE(paths.config.stat().st_mode) == 0o700
+    assert stat.S_IMODE(paths.config_file.stat().st_mode) == 0o600
 
 
 def test_invalid_values_are_normalized(tmp_path) -> None:
@@ -93,7 +96,7 @@ def test_v2_latency_and_model_defaults_migrate_without_overwriting_explicit_xtts
 
     migrated = ConfigStore(paths).load()
 
-    assert migrated.version == 3
+    assert migrated.version == 4
     assert migrated.hermes.profile == "codex-cloud"
     assert migrated.hermes.model == "gpt-5.6-sol"
     assert migrated.voice.mode == "piper"

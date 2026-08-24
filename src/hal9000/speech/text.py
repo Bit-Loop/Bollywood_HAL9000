@@ -12,6 +12,10 @@ _IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 _AUTOLINK = re.compile(r"<((?:https?://|mailto:)[^>]+)>", re.IGNORECASE)
 _RAW_URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_EVIDENCE_HANDLE = re.compile(
+    r"\[(?:memory|audio|visual|probe|action|verification|interruption|evidence):[^\]]+\]",
+    re.IGNORECASE,
+)
 _INDENTED_CODE = re.compile(r"(?m)^(?:\t| {4,})\S[^\n]*(?:\n|$)")
 _HTML = re.compile(r"<[^>]+>")
 _LIST_PREFIX = re.compile(r"(?m)^\s*(?:[-+*•]\s+|\d+[.)]\s+)")
@@ -51,6 +55,7 @@ def markdown_to_speech(text: str) -> str:
     value = text.replace("\r\n", "\n").replace("\r", "\n")
     value = _FENCED_CODE.sub(" ", value)
     value = _INDENTED_CODE.sub(" ", value)
+    value = _EVIDENCE_HANDLE.sub(" ", value)
     value = _IMAGE.sub(lambda match: match.group(1), value)
     value = _LINK.sub(lambda match: match.group(1), value)
     value = _AUTOLINK.sub(lambda match: _url_without_noise(match), value)

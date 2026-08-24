@@ -6,7 +6,10 @@ CONFIG_ROOT="${XDG_CONFIG_HOME:-${HOME}/.config}"
 CACHE_ROOT="${XDG_CACHE_HOME:-${HOME}/.cache}"
 STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}"
 
-rm -f "${HOME}/.local/bin/hal9000"
+rm -f \
+    "${HOME}/.local/bin/hal9000" \
+    "${HOME}/.local/bin/hal-self" \
+    "${HOME}/.local/bin/hal-self-mcp"
 rm -f "${DATA_ROOT}/applications/com.bitloop.HAL9000.desktop"
 rm -f "${DATA_ROOT}/icons/hicolor/scalable/apps/com.bitloop.HAL9000.svg"
 rm -f "${CONFIG_ROOT}/autostart/com.bitloop.HAL9000.desktop"

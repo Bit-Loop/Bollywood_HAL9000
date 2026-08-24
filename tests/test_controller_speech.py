@@ -6,9 +6,10 @@ from hal9000.config import AppConfig, ConfigStore
 from hal9000.controller import HalController
 from hal9000.paths import AppPaths
 from hal9000.speech.tts.base import AudioBuffer
+from hal9000.state import HalState
 
 
-def build_controller(tmp_path) -> HalController:
+def build_controller(tmp_path, config: AppConfig | None = None) -> HalController:
     paths = AppPaths(
         config=tmp_path / "config",
         data=tmp_path / "data",
@@ -17,7 +18,7 @@ def build_controller(tmp_path) -> HalController:
         logs=tmp_path / "state" / "logs",
     )
     paths.ensure()
-    config = AppConfig()
+    config = config or AppConfig()
     config.general.setup_complete = True
     return HalController(
         paths,
@@ -26,6 +27,16 @@ def build_controller(tmp_path) -> HalController:
         tmp_path,
         services_enabled=False,
     )
+
+
+def test_disabling_machine_self_does_not_register_its_hermes_mcp(qtbot, tmp_path) -> None:
+    config = AppConfig()
+    config.sentience.enabled = False
+    controller = build_controller(tmp_path, config)
+    assert controller.hermes._self_mcp_enabled is False
+    controller.shutdown()
+    controller.deleteLater()
+    qtbot.wait(20)
 
 
 def test_controller_starts_tts_on_first_complete_streamed_sentence(
@@ -85,6 +96,31 @@ def test_stop_voice_rejects_audio_already_queued_from_the_worker(
 
     assert played == []
     assert controller.speakerLevel == 0.0
+    controller.shutdown()
+    controller.deleteLater()
+    qtbot.wait(20)
+
+
+def test_exact_critical_machine_degradation_cancels_active_task_once(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    controller = build_controller(tmp_path)
+    cancelled: list[bool] = []
+    notices: list[str] = []
+    monkeypatch.setattr(controller.hermes, "cancel", lambda: cancelled.append(True))
+    controller.notification.connect(notices.append)
+    controller._active_machine_task_id = "task-critical"
+    controller._transition(HalState.THINKING, "test active task")
+
+    controller._stop_for_machine_degradation("another-task")
+    controller._stop_for_machine_degradation("task-critical")
+    controller._stop_for_machine_degradation("task-critical")
+
+    assert cancelled == [True]
+    assert controller.state == HalState.ERROR.value
+    assert notices == [
+        "HAL checkpointed this task because an exact required capability was lost"
+    ]
     controller.shutdown()
     controller.deleteLater()
     qtbot.wait(20)

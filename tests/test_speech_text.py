@@ -86,6 +86,17 @@ Done.
     assert "(" not in nested_link and ")" not in nested_link
 
 
+def test_markdown_to_speech_drops_machine_evidence_handles() -> None:
+    spoken = markdown_to_speech(
+        "I remember the verified repair [memory:fact-177]. "
+        "I checked it [probe:event-991]."
+    )
+
+    assert spoken == "I remember the verified repair. I checked it."
+    assert "fact-177" not in spoken
+    assert "event-991" not in spoken
+
+
 def test_speech_chunker_releases_short_phrases_before_large_blocks_accumulate() -> None:
     chunker = SpeechChunker()
     long_thought = " ".join(["measured"] * 24)
