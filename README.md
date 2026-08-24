@@ -6,7 +6,7 @@ agent, session, model, memory, MCP, Codex, browser, terminal, tool, and approval
 orchestrator. This application owns the physical HAL interface, lifecycle,
 local audio capture, wake detection, transcription, and speech output.
 
-The visible standby shell is deliberately only the HAL header, dark optical
+The visible standby shell is deliberately only the HAL nameplate, dim optical
 eye, and speaker grille. Double-clicking the grille folds it open into the
 shared Hermes conversation; triple-clicking closes it without the preceding
 double-click reopening it.
@@ -20,13 +20,19 @@ double-click reopening it.
 - Hermes `serve` JSON-RPC over WebSocket, including durable session resume,
   streaming text, actual tool events, cancellation, approvals, health probing,
   reconnect/backoff, and owned-process shutdown.
+- Session-scoped Hermes model selection from its authenticated provider list.
+  HAL uses the isolated `codex-cloud` profile with the ChatGPT-subscription
+  `openai-codex/gpt-5.6-sol` route at medium reasoning, without changing other
+  Hermes sessions or global config and without Hybrid-MoA's local advisors.
 - One 16 kHz microphone stream shared by Sherpa open-vocabulary wake detection,
   VAD capture, and push-to-talk. Raw microphone audio is not persisted.
 - Faster-Whisper `small`/English, with CUDA inference attempted first and a
   tested CPU/int8 fallback when CTranslate2 cannot use the host CUDA runtime.
 - Real Coqui XTTS-v2 inference with `CoderCowMoo/XTTS-v2.0-HAL-9000`, plus real
-  Piper inference with `campwill/HAL-9000-Piper-TTS`. Auto strongly prefers a
-  healthy interactive XTTS and falls back to Piper once if XTTS fails.
+  Piper inference with `campwill/HAL-9000-Piper-TTS`. Piper is the low-latency
+  default; XTTS remains an explicit high-fidelity option, and Auto chooses the
+  faster healthy engine. HAL sanitizes streamed Markdown and begins synthesizing
+  short complete phrases before the full response finishes.
 - Atomic versioned XDG configuration, desktop-keyring storage for an optional
   remote Hermes token, managed model caches, rotating logs, and reversible XDG
   autostart.
@@ -78,17 +84,20 @@ also intend to remove HAL configuration, state, logs, and cached model weights.
 
 - Double-click speaker grille: open the manual console.
 - Triple-click grille or exposed handle: close the console.
-- `Ctrl+Shift+S`: settings from anywhere.
+- Right-click empty black chassis space: open settings. The eye and speaker
+  grille deliberately retain their own controls.
+- `Ctrl+Shift+S`: open settings while HAL has keyboard focus.
 - `Ctrl+L`: focus the open manual composer.
 - `Ctrl+Enter`: send the typed prompt.
 - `Ctrl+Shift+M`: toggle microphone mute.
 - `Esc`: close settings or the manual drawer when no approval is unresolved.
 - `F11`: toggle fullscreen.
 
-Settings include window/monitor/autostart behavior, Hermes backend management,
-wake and STT controls, input/output devices and live mic level, voice mode and
-A/B playback, benchmark results, appearance controls, approval status, and a
-diagnostics report with log/config reveal actions.
+Settings include window/monitor/autostart behavior, ZIP/postal context for
+weather and local questions, a live Hermes model selector and reasoning level,
+Hermes backend management, wake and STT controls, input/output devices and live
+mic level, voice mode and A/B playback, benchmark results, appearance controls,
+approval status, and a diagnostics report with log/config reveal actions.
 
 ## Configuration and security
 

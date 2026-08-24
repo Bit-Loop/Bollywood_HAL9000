@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+import threading
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
 
@@ -18,7 +19,7 @@ class TtsManager(QObject):
     activeEngineChanged = Signal(str)
     progressChanged = Signal(str, float)
     engineStatusChanged = Signal()
-    synthesisReady = Signal(object)
+    synthesisReady = Signal(object, int)
     fallbackOccurred = Signal(str)
     benchmarkCompleted = Signal(dict, str, str)
     errorOccurred = Signal(str)
@@ -41,12 +42,16 @@ class TtsManager(QObject):
         }
         self._status = "not loaded"
         self._active_engine = ""
-        self._auto_selection = auto_selection if auto_selection in {"XTTS", "Piper"} else "XTTS"
+        self._auto_selection = auto_selection if auto_selection in {"XTTS", "Piper"} else "Piper"
         self._xtts_broken = False
         self._last_fallback = ""
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hal9000-tts")
         self._engine_status = {"XTTS": "not loaded", "Piper": "not loaded"}
         self._progress_engine = ""
+        self._speech_generation = 0
+        self._speech_futures: set[Future] = set()
+        self._speech_lock = threading.Lock()
+        self._closed = False
 
     @Property(str, notify=statusChanged)
     def status(self) -> str:
@@ -68,11 +73,34 @@ class TtsManager(QObject):
     def piperStatus(self) -> str:
         return self._engine_status["Piper"]
 
+    @property
+    def speechGeneration(self) -> int:
+        """Token carried with audio so the controller can reject stale Qt events."""
+
+        with self._speech_lock:
+            return self._speech_generation
+
     @Slot()
     def preload(self) -> None:
-        if self._status in {"loading", "benchmarking", "synthesizing"}:
+        if self._closed or self._status in {"loading", "benchmarking", "synthesizing"}:
             return
         preferred = self._preferred_name()
+        if self.mode == "auto" and preferred == "XTTS":
+            capacity_check = getattr(
+                self.engines["XTTS"], "interactive_cuda_available", None
+            )
+            if callable(capacity_check):
+                self._progress_engine = "XTTS"
+                self._set_engine_status("XTTS", "checking CUDA")
+                self._set_status("loading")
+                future = self._executor.submit(capacity_check)
+                future.add_done_callback(self._auto_preload_checked)
+                return
+        self._start_preload(preferred)
+
+    def _start_preload(self, preferred: str) -> None:
+        if self._closed:
+            return
         self._progress_engine = preferred
         self._set_engine_status(preferred, "loading")
         self._set_status("loading")
@@ -82,27 +110,39 @@ class TtsManager(QObject):
     @Slot(str)
     def speak(self, text: str) -> None:
         clean = text.strip()
-        if not clean:
+        if self._closed or not clean:
             return
         self._progress_engine = self._preferred_name()
         self._set_status("synthesizing")
+        with self._speech_lock:
+            generation = self._speech_generation
         future = self._executor.submit(self._synthesize_with_fallback, clean)
-        future.add_done_callback(self._synthesis_done)
+        with self._speech_lock:
+            self._speech_futures.add(future)
+        future.add_done_callback(
+            lambda result, token=generation: self._synthesis_done(result, token)
+        )
 
     @Slot(str, str)
     def speakWith(self, engine: str, text: str) -> None:
         clean = text.strip()
         normalized = "XTTS" if engine.strip().lower() == "xtts" else "Piper"
-        if not clean:
+        if self._closed or not clean:
             return
         self._progress_engine = normalized
         self._set_status("synthesizing")
+        with self._speech_lock:
+            generation = self._speech_generation
         future = self._executor.submit(self._synthesize_explicit, normalized, clean)
-        future.add_done_callback(self._synthesis_done)
+        with self._speech_lock:
+            self._speech_futures.add(future)
+        future.add_done_callback(
+            lambda result, token=generation: self._synthesis_done(result, token)
+        )
 
     @Slot()
     def runBenchmark(self) -> None:
-        if self._status in {"loading", "benchmarking", "synthesizing"}:
+        if self._closed or self._status in {"loading", "benchmarking", "synthesizing"}:
             return
         self._set_engine_status("XTTS", "benchmarking")
         self._set_engine_status("Piper", "queued")
@@ -115,8 +155,26 @@ class TtsManager(QObject):
         if normalized in {"auto", "xtts", "piper"}:
             self.mode = normalized
 
+    @Slot()
+    def cancelPending(self) -> None:
+        """Discard queued/running speech results from the previous turn."""
+
+        with self._speech_lock:
+            self._speech_generation += 1
+            futures = tuple(self._speech_futures)
+            self._speech_futures.clear()
+        for future in futures:
+            future.cancel()
+
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._closed:
+            return
+        self._closed = True
+        self.cancelPending()
+        # Engines own native CPU/CUDA state. Do not unload it under an active
+        # inference call; that race can repopulate or access a half-torn-down
+        # model and keep the process consuming resources after the window exits.
+        self._executor.shutdown(wait=True, cancel_futures=True)
         for engine in self.engines.values():
             engine.unload()
 
@@ -183,6 +241,8 @@ class TtsManager(QObject):
         return results, selected, reason
 
     def _preload_done(self, name: str, future: Future) -> None:
+        if self._closed:
+            return
         try:
             future.result()
         except Exception as exc:
@@ -191,20 +251,38 @@ class TtsManager(QObject):
                 self._last_fallback = f"XTTS initialization failed: {exc}"
                 self.fallbackOccurred.emit(self._last_fallback)
                 self._set_engine_status("XTTS", "error")
-                self._progress_engine = "Piper"
-                self._set_engine_status("Piper", "loading")
-                fallback = self._executor.submit(self.engines["Piper"].initialize, self._progress)
-                fallback.add_done_callback(lambda result: self._preload_done("Piper", result))
+                self._start_preload("Piper")
                 return
             self._set_status("error")
             self._set_engine_status(name, "error")
             self.errorOccurred.emit(str(exc))
             return
+        if (
+            name == "XTTS"
+            and self.mode == "auto"
+            and self.engines["XTTS"].backend == "CPU"
+        ):
+            self._auto_selection = "Piper"
+            self._last_fallback = (
+                "Auto selected Piper because XTTS could not secure interactive CUDA capacity"
+            )
+            self.fallbackOccurred.emit(self._last_fallback)
+            self._set_engine_status("XTTS", "CPU deferred")
+            self.engines["XTTS"].unload()
+            self._start_preload("Piper")
+            return
         self._set_active_engine(name)
         self._set_engine_status(name, "ready")
         self._set_status("ready")
 
-    def _synthesis_done(self, future: Future) -> None:
+    def _synthesis_done(self, future: Future, generation: int) -> None:
+        if self._closed:
+            return
+        with self._speech_lock:
+            self._speech_futures.discard(future)
+            current_generation = self._speech_generation
+        if future.cancelled() or generation != current_generation:
+            return
         try:
             audio = future.result()
         except Exception as exc:
@@ -212,9 +290,11 @@ class TtsManager(QObject):
             self.errorOccurred.emit(str(exc))
             return
         self._set_status("ready")
-        self.synthesisReady.emit(audio)
+        self.synthesisReady.emit(audio, generation)
 
     def _benchmark_done(self, future: Future) -> None:
+        if self._closed:
+            return
         try:
             results, selected, reason = future.result()
         except Exception as exc:
@@ -225,6 +305,25 @@ class TtsManager(QObject):
         if selected:
             self._set_active_engine(selected)
         self.benchmarkCompleted.emit(results, selected, reason)
+
+    def _auto_preload_checked(self, future: Future) -> None:
+        if self._closed:
+            return
+        try:
+            available, detail = future.result()
+        except Exception as exc:
+            available, detail = False, f"XTTS CUDA capacity probe failed: {exc}"
+        if self.mode != "auto":
+            self._start_preload(self._preferred_name())
+            return
+        if available:
+            self._start_preload("XTTS")
+            return
+        self._auto_selection = "Piper"
+        self._last_fallback = f"Auto selected Piper for low latency: {detail}"
+        self._set_engine_status("XTTS", "CUDA capacity unavailable")
+        self.fallbackOccurred.emit(self._last_fallback)
+        self._start_preload("Piper")
 
     def _progress(self, label: str, fraction: float) -> None:
         if self._progress_engine:

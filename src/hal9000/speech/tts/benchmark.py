@@ -101,12 +101,14 @@ def select_auto_engine(results: dict[str, list[dict]]) -> tuple[str, str]:
     piper = results.get("Piper") or []
     xtts_ok = bool(xtts) and all(row.get("synthesized") for row in xtts)
     piper_ok = bool(piper) and all(row.get("synthesized") for row in piper)
-    if xtts_ok:
+    if xtts_ok and piper_ok:
         worst_rtf = max(float(row.get("real_time_factor") or 0.0) for row in xtts)
-        if worst_rtf <= 5.0 or not piper_ok:
-            return "XTTS", "XTTS completed all phrases reliably within the interactive latency ceiling"
-        return "Piper", f"XTTS was operational but absurdly slow (worst real-time factor {worst_rtf:.2f})"
+        if worst_rtf > 5.0:
+            return "Piper", f"XTTS was operational but absurdly slow (worst real-time factor {worst_rtf:.2f})"
+        return "Piper", "Piper completed all phrases with lower interactive latency"
     if piper_ok:
         reason = next((str(row.get("error")) for row in xtts if row.get("error")), "XTTS unavailable")
         return "Piper", reason
+    if xtts_ok:
+        return "XTTS", "Piper was unavailable; XTTS completed all phrases reliably"
     return "", "Neither local HAL voice completed the benchmark"

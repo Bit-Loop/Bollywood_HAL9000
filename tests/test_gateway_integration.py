@@ -9,6 +9,7 @@ from websockets.sync.server import serve
 from hal9000.config import HermesSettings
 from hal9000.hermes.client import HermesGatewayClient
 from hal9000.hermes.discovery import discover_hermes
+from hal9000.hermes.process import HermesProcessManager
 from hal9000.hermes.service import HermesService
 
 
@@ -112,5 +113,214 @@ def test_graceful_hermes_unavailability_keeps_service_controllable(qtbot, tmp_pa
     assert errors
     service.close()
     qtbot.wait(80)
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_owned_backend_launch_is_pinned_to_hals_profile(qtbot, tmp_path) -> None:
+    executable = tmp_path / "fake-hermes"
+    executable.write_text(
+        "#!/bin/sh\nprintf 'ARGS=%s\\n' \"$*\"\nprintf 'HERMES_BACKEND_READY port=41234\\n'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    manager = HermesProcessManager(executable, profile="codex-cloud")
+    output: list[str] = []
+    manager.outputReceived.connect(output.append)
+
+    manager.start()
+
+    qtbot.waitUntil(lambda: any("ARGS=" in item for item in output), timeout=1500)
+    assert "--profile codex-cloud serve --host 127.0.0.1 --port 0 --skip-build" in " ".join(output)
+    manager.stop()
+    manager.deleteLater()
+    qtbot.wait(20)
+
+
+def test_model_inventory_and_switch_use_supported_gateway_methods(qtbot, tmp_path) -> None:
+    settings = HermesSettings(executable=str(tmp_path / "missing-hermes"))
+    service = HermesService(settings, tmp_path)
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+
+    def request(method: str, params: dict, timeout_ms: int = 120_000) -> str:
+        requests.append((method, params))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    options: list[dict] = []
+    switched: list[tuple[str, str]] = []
+    service.modelOptionsReady.connect(options.append)
+    service.modelChanged.connect(lambda provider, model: switched.append((provider, model)))
+    service.settings.reasoning_effort = ""
+
+    service.requestModelOptions()
+    assert requests[-1] == (
+        "model.options",
+        {"session_id": "runtime-session", "explicit_only": False},
+    )
+
+    service.switchModel("custom:local lab", "qwen/model 32b")
+    request_id = "request-2"
+    assert requests[-1][0] == "config.set"
+    assert requests[-1][1]["session_id"] == "runtime-session"
+    assert requests[-1][1]["key"] == "model"
+    assert requests[-1][1]["value"] == (
+        "'qwen/model 32b' --session --provider 'custom:local lab'"
+    )
+
+    service._on_rpc_result(
+        request_id,
+        "config.set",
+        {"output": "Switched model"},
+    )
+    assert switched == [("custom:local lab", "qwen/model 32b")]
+    assert requests[-1][0] == "model.options"
+
+    service._on_rpc_result(
+        "inventory",
+        "model.options",
+        {"providers": [], "provider": "copilot", "model": "gpt-5.6"},
+    )
+    assert options[-1]["model"] == "gpt-5.6"
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_failed_required_model_switch_does_not_send_prompt_on_global_model(
+    qtbot, tmp_path
+) -> None:
+    settings = HermesSettings(executable=str(tmp_path / "missing-hermes"))
+    service = HermesService(settings, tmp_path)
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    service._queued_prompt = "Use the requested model"
+    requests: list[tuple[str, dict]] = []
+    errors: list[str] = []
+
+    def request(method: str, params: dict, timeout_ms: int = 120_000) -> str:
+        requests.append((method, params))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service.errorOccurred.connect(errors.append)
+    service.switchModel("openai-codex", "gpt-5.6-sol")
+    service._on_rpc_error("request-1", "config.set", "subscription unavailable", 5001)
+    service.sendPrompt("A later prompt must also stay blocked")
+
+    assert service._queued_prompt == ""
+    assert not any(method == "prompt.submit" for method, _params in requests)
+    assert "did not send" in errors[-1]
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_cancel_discards_prompt_waiting_for_session_preferences(qtbot, tmp_path) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    service._preferences_pending = True
+    requests: list[tuple[str, dict]] = []
+
+    def request(method: str, params: dict, timeout_ms: int = 120_000) -> str:
+        requests.append((method, params))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service.sendPrompt("Do not run after stop")
+    service.cancel()
+    service._finish_session_preferences()
+
+    assert service._queued_prompt == ""
+    assert [method for method, _params in requests] == [
+        "session.interrupt",
+        "model.options",
+    ]
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_only_latest_model_workflow_can_release_a_queued_prompt(qtbot, tmp_path) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+    switched: list[tuple[str, str]] = []
+
+    def request(method: str, params: dict, timeout_ms: int = 120_000) -> str:
+        requests.append((method, params))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service.modelChanged.connect(lambda provider, model: switched.append((provider, model)))
+
+    service.switchModel("openai-codex", "gpt-5.6-terra")
+    service.switchModel("openai-codex", "gpt-5.6-sol")
+    service.sendPrompt("Use only the latest model")
+
+    service._on_rpc_result("request-1", "config.set", {"output": "old model applied"})
+    assert [method for method, _params in requests] == ["config.set", "config.set"]
+
+    service._on_rpc_result("request-2", "config.set", {"output": "new model applied"})
+
+    assert not any(method == "prompt.submit" for method, _params in requests)
+
+    service._on_rpc_result("request-3", "config.set", {"output": "new reasoning applied"})
+
+    prompt_requests = [params for method, params in requests if method == "prompt.submit"]
+    assert prompt_requests == [
+        {"session_id": "runtime-session", "text": "Use only the latest model"}
+    ]
+    assert switched == [("openai-codex", "gpt-5.6-sol")]
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_interim_and_completion_metadata_reach_speech_reconciliation(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service._runtime_session_id = "runtime-session"
+    interims: list[tuple[str, bool]] = []
+    completions: list[tuple[str, bool]] = []
+    service.assistantInterim.connect(
+        lambda text, already_streamed: interims.append((text, already_streamed))
+    )
+    service.assistantCompleted.connect(
+        lambda text, previewed: completions.append((text, previewed))
+    )
+
+    service._on_event(
+        {
+            "type": "message.interim",
+            "session_id": "runtime-session",
+            "payload": {"text": "Working note.", "already_streamed": True},
+        }
+    )
+    service._on_event(
+        {
+            "type": "message.complete",
+            "session_id": "runtime-session",
+            "payload": {"text": "Final answer.", "response_previewed": True},
+        }
+    )
+
+    assert interims == [("Working note.", True)]
+    assert completions == [("Final answer.", True)]
+    service.close()
     service.deleteLater()
     qtbot.wait(20)

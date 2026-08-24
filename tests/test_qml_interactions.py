@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QUrl
+from PySide6.QtCore import QObject, QPoint, Qt, QUrl
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtTest import QTest
 
@@ -58,6 +58,57 @@ def test_ctrl_shift_s_opens_settings_from_closed_console(qtbot, tmp_path) -> Non
             Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
         )
         qtbot.waitUntil(lambda: controller.settingsOpen, timeout=700)
+        assert window.findChild(QObject, "postalCodeField") is not None
+        assert window.findChild(QObject, "hermesModelSelector") is not None
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_qml_setting_signal_accepts_javascript_primitive_values(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        selector = window.findChild(QObject, "backendModeSelector")
+        assert selector is not None
+
+        selector.setProperty("currentIndex", 1)
+        selector.activated.emit(1)
+
+        qtbot.waitUntil(lambda: controller.config.hermes.mode == "remote", timeout=700)
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_right_click_empty_chassis_opens_settings_but_controls_do_not(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        console = window.findChild(QObject, "consoleFrame")
+        eye = window.findChild(QObject, "halEye")
+        speaker = window.findChild(QObject, "speakerAssembly")
+        assert console is not None and eye is not None and speaker is not None
+
+        empty_point = QPoint(
+            int(console.property("x") + console.property("width") * 0.5),
+            int(console.property("y") + console.property("height") * 0.2),
+        )
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, pos=empty_point)
+        qtbot.waitUntil(lambda: controller.settingsOpen, timeout=700)
+
+        controller.closeSettings()
+        eye_point = QPoint(
+            int(eye.property("x") + eye.property("width") * 0.5),
+            int(eye.property("y") + eye.property("height") * 0.5),
+        )
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, pos=eye_point)
+        QTest.qWait(80)
+        assert controller.settingsOpen is False
+
+        speaker_point = QPoint(
+            int(speaker.property("x") + speaker.property("width") * 0.5),
+            int(speaker.property("y") + speaker.property("height") * 0.5),
+        )
+        QTest.mouseClick(window, Qt.MouseButton.RightButton, pos=speaker_point)
+        QTest.qWait(80)
+        assert controller.settingsOpen is False
     finally:
         close_ui(qtbot, controller, engine, window)
 
@@ -105,5 +156,25 @@ def test_required_responsive_sizes_keep_physical_components_in_bounds(qtbot, tmp
                 assert item.property("y") >= 0
                 assert item.property("x") + item.property("width") <= width + 1
                 assert item.property("y") + item.property("height") <= height + 1
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_hal_and_9000_are_centered_in_their_own_nameplate_fields(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        blue = window.findChild(QObject, "headerBlueField")
+        black = window.findChild(QObject, "headerBlackField")
+        hal = window.findChild(QObject, "headerHalLabel")
+        model = window.findChild(QObject, "header9000Label")
+        assert all((blue, black, hal, model))
+
+        hal_center = hal.property("x") + hal.property("width") / 2
+        blue_center = blue.property("x") + blue.property("width") / 2
+        model_center = model.property("x") + model.property("width") / 2
+        black_center = black.property("x") + black.property("width") / 2
+
+        assert abs(hal_center - blue_center) <= 1.5
+        assert abs(model_center - black_center) <= 1.5
     finally:
         close_ui(qtbot, controller, engine, window)

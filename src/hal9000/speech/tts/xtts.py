@@ -33,6 +33,31 @@ class XttsHalEngine(TtsEngine):
     def backend(self) -> str:
         return self._backend
 
+    def interactive_cuda_available(
+        self, minimum_free_bytes: int = 3 * 1024**3
+    ) -> tuple[bool, str]:
+        """Return whether XTTS can use CUDA without crowding the live desktop."""
+
+        if not self.prefer_cuda:
+            return False, "XTTS CUDA is disabled"
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False, "CUDA is unavailable"
+            free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        except Exception as exc:
+            return False, f"CUDA capacity probe failed: {exc}"
+        free_gib = free_bytes / 1024**3
+        required_gib = minimum_free_bytes / 1024**3
+        if free_bytes < minimum_free_bytes:
+            return (
+                False,
+                f"XTTS has {free_gib:.1f} GiB free CUDA memory; "
+                f"interactive mode requires {required_gib:.1f} GiB",
+            )
+        return True, f"XTTS has {free_gib:.1f} GiB free CUDA memory"
+
     def initialize(self, progress=None) -> None:
         if self._model is not None:
             return
@@ -114,7 +139,9 @@ class XttsHalEngine(TtsEngine):
             top_k=50,
             top_p=0.85,
             speed=speed,
-            enable_text_splitting=True,
+            # HAL already streams sentence-sized chunks. Coqui's secondary
+            # splitter adds latency and pulls in optional language packages.
+            enable_text_splitting=False,
         )
         samples = np.asarray(output.get("wav"), dtype=np.float32).reshape(-1)
         sample_rate = int(getattr(self._config.audio, "output_sample_rate", 24_000))

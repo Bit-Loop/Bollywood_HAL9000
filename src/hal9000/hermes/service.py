@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -28,13 +29,18 @@ class HermesService(QObject):
     latencyChanged = Signal(float)
     assistantStarted = Signal(str)
     assistantDelta = Signal(str)
-    assistantCompleted = Signal(str)
+    assistantInterim = Signal(str, bool)
+    assistantCompleted = Signal(str, bool)
     toolActivity = Signal(dict)
     approvalRequested = Signal(dict)
     approvalResolved = Signal(str)
     turnFinished = Signal()
     errorOccurred = Signal(str)
     integrationsChanged = Signal(list)
+    modelOptionsReady = Signal(dict)
+    modelChanged = Signal(str, str)
+    reasoningChanged = Signal(str)
+    modelOperationError = Signal(str)
     _probeFinished = Signal(object)
 
     def __init__(
@@ -66,6 +72,15 @@ class HermesService(QObject):
         self._want_running = False
         self._probe_pending = False
         self._restart_attempts = 0
+        self._model_switch_requests: dict[str, tuple[int, str, str]] = {}
+        self._reasoning_requests: dict[str, tuple[int, str]] = {}
+        self._preference_generation = 0
+        self._preference_state = "unconfigured"
+        self._desired_provider = settings.provider
+        self._desired_model = settings.model
+        self._desired_reasoning = settings.reasoning_effort
+        self._preferences_pending = False
+        self._preferences_failed = False
         self._probe_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hal9000-hermes-probe"
         )
@@ -111,6 +126,13 @@ class HermesService(QObject):
             self._ws_url = socket_url
             self.client.connectTo(socket_url)
             return
+        # A named HAL profile is an isolation boundary. Reusing a backend that
+        # was launched under the desktop's sticky Hybrid-MoA profile would
+        # inherit its local Qwen/Devstral advisors and defeat the cloud-only
+        # route selected for HAL.
+        if self.settings.profile:
+            self._launch_owned_backend()
+            return
         if is_loopback_url(self.settings.backend_url) and not self._probe_pending:
             self._set_status("probing")
             self._probe_pending = True
@@ -125,6 +147,13 @@ class HermesService(QObject):
     def stop(self) -> None:
         self._want_running = False
         self._restart_timer.stop()
+        self._preference_generation += 1
+        self._preference_state = "unconfigured"
+        self._preferences_pending = False
+        self._preferences_failed = False
+        self._model_switch_requests.clear()
+        self._reasoning_requests.clear()
+        self._queued_prompt = ""
         self.client.close()
         if self.process is not None:
             self.process.stop()
@@ -160,11 +189,16 @@ class HermesService(QObject):
         clean = text.strip()
         if not clean:
             return
-        if not self._runtime_session_id:
+        if self._preferences_failed:
+            self.errorOccurred.emit(
+                "HAL did not send the prompt because its required session model is not active"
+            )
+            return
+        if not self._runtime_session_id or self._preferences_pending:
             self._queued_prompt = clean
-            if self.client.connected:
+            if self.client.connected and not self._runtime_session_id:
                 self._create_or_resume_session()
-            else:
+            elif not self.client.connected:
                 self.errorOccurred.emit("Hermes is not connected")
             return
         self.client.request(
@@ -174,10 +208,132 @@ class HermesService(QObject):
 
     @Slot()
     def cancel(self) -> None:
+        self._queued_prompt = ""
         if self._runtime_session_id:
             self.client.request(
                 "session.interrupt", {"session_id": self._runtime_session_id}, 20_000
             )
+
+    @Slot(bool)
+    def requestModelOptions(self, refresh: bool = False) -> None:
+        if not self._runtime_session_id:
+            self.modelOperationError.emit(
+                "Hermes model list is unavailable until a session connects"
+            )
+            return
+        if not self.client.connected:
+            self.modelOperationError.emit("Hermes model list is unavailable while offline")
+            return
+        self.client.request(
+            "model.options",
+            {
+                "session_id": self._runtime_session_id,
+                "explicit_only": False,
+                **({"refresh": True} if refresh else {}),
+            },
+            60_000,
+        )
+
+    @Slot(str, str)
+    def switchModel(self, provider: str, model: str) -> None:
+        clean_provider = provider.strip()
+        clean_model = model.strip()
+        if not self._runtime_session_id:
+            self.modelOperationError.emit(
+                "Hermes model cannot be changed until a session connects"
+            )
+            return
+        if not self.client.connected:
+            message = "Hermes model cannot be changed while offline"
+            self.modelOperationError.emit(message)
+            return
+        if not clean_model:
+            self.modelOperationError.emit("Choose a Hermes model first")
+            return
+        self._desired_provider = clean_provider
+        self._desired_model = clean_model
+        self._desired_reasoning = self.settings.reasoning_effort
+        self._begin_preference_workflow()
+
+    def _begin_preference_workflow(self) -> None:
+        self._preference_generation += 1
+        generation = self._preference_generation
+        self._preferences_pending = True
+        self._preferences_failed = False
+        self._preference_state = "applying"
+        if not self._runtime_session_id:
+            self._fail_preference_workflow(
+                generation,
+                "Hermes preferences cannot be changed until a session connects",
+            )
+            return
+        if not self.client.connected:
+            self._fail_preference_workflow(
+                generation,
+                "Hermes preferences cannot be changed while offline",
+            )
+            return
+        if not self._desired_model:
+            if self._desired_reasoning:
+                self._request_reasoning(generation, self._desired_reasoning)
+            else:
+                self._finish_session_preferences(generation)
+            return
+        self._request_model(
+            generation,
+            self._desired_provider,
+            self._desired_model,
+        )
+
+    def _request_model(self, generation: int, provider: str, model: str) -> None:
+        value = f"{shlex.quote(model)} --session"
+        if provider:
+            value += f" --provider {shlex.quote(provider)}"
+        request_id = self.client.request(
+            "config.set",
+            {
+                "session_id": self._runtime_session_id,
+                "key": "model",
+                "value": value,
+            },
+            120_000,
+        )
+        self._model_switch_requests[request_id] = (generation, provider, model)
+
+    @Slot(str)
+    def setReasoning(self, effort: str) -> None:
+        normalized = effort.strip().lower()
+        if normalized not in {
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+        }:
+            message = f"Unsupported reasoning effort: {effort}"
+            self.modelOperationError.emit(message)
+            self._preference_generation += 1
+            self._fail_preference_workflow(self._preference_generation, message)
+            return
+        if not self._runtime_session_id:
+            self.modelOperationError.emit(
+                "Hermes reasoning cannot be changed until a session connects"
+            )
+            return
+        if not self.client.connected:
+            message = "Hermes reasoning cannot be changed while offline"
+            self.modelOperationError.emit(message)
+            return
+        self._desired_reasoning = normalized
+        self._begin_preference_workflow()
+
+    def _request_reasoning(self, generation: int, effort: str) -> None:
+        request_id = self.client.request(
+            "config.set",
+            {
+                "session_id": self._runtime_session_id,
+                "key": "reasoning",
+                "value": effort,
+            },
+            60_000,
+        )
+        self._reasoning_requests[request_id] = (generation, effort)
 
     @Slot(str, str)
     def respondApproval(self, request_id: str, choice: str) -> None:
@@ -230,11 +386,17 @@ class HermesService(QObject):
             return
         self._set_status("starting")
         if self.process is None:
-            self.process = HermesProcessManager(self.installation.executable, self)
+            self.process = HermesProcessManager(
+                self.installation.executable,
+                self,
+                profile=self.settings.profile,
+            )
             self.process.backendReady.connect(self._on_backend_ready)
             self.process.errorOccurred.connect(self._on_process_error)
             self.process.outputReceived.connect(self._log_process_output)
             self.process.runningChanged.connect(self._on_process_running)
+        else:
+            self.process.profile = self.settings.profile.strip()
         self.process.start()
 
     def _on_backend_ready(self, _base_url: str, ws_url: str) -> None:
@@ -274,7 +436,7 @@ class HermesService(QObject):
             },
         )
 
-    def _on_rpc_result(self, _request_id: str, method: str, result: Any) -> None:
+    def _on_rpc_result(self, request_id: str, method: str, result: Any) -> None:
         payload = result if isinstance(result, dict) else {}
         if method in {"session.create", "session.resume"}:
             self._runtime_session_id = str(payload.get("session_id") or "")
@@ -286,22 +448,112 @@ class HermesService(QObject):
             info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
             tools = info.get("tools") if isinstance(info.get("tools"), dict) else {}
             self.integrationsChanged.emit(sorted(map(str, tools.keys())))
-            queued = self._queued_prompt
-            self._queued_prompt = ""
-            if queued:
-                self.sendPrompt(queued)
+            self._desired_provider = self.settings.provider
+            self._desired_model = self.settings.model
+            self._desired_reasoning = self.settings.reasoning_effort
+            self._begin_preference_workflow()
+        elif method == "model.options":
+            logging.getLogger("hal9000.hermes").info(
+                "Hermes model inventory loaded: %d providers",
+                len(payload.get("providers") or []),
+            )
+            self.modelOptionsReady.emit(payload)
+        elif method == "config.set" and request_id in self._model_switch_requests:
+            generation, provider, model = self._model_switch_requests.pop(request_id)
+            if generation != self._preference_generation:
+                return
+            warning = str(payload.get("warning") or "").strip()
+            if bool(payload.get("confirm_required")):
+                message = str(
+                    payload.get("confirm_message")
+                    or "Hermes requires confirmation for this model"
+                )
+                self.modelOperationError.emit(message)
+                self._fail_preference_workflow(generation, message)
+                return
+            if warning and "failed" in warning.lower():
+                self.modelOperationError.emit(warning)
+                self._fail_preference_workflow(generation, warning)
+                return
+            self.settings.provider = provider
+            self.settings.model = model
+            logging.getLogger("hal9000.hermes").info(
+                "HAL session model selected: %s // %s", provider or "automatic", model
+            )
+            self.modelChanged.emit(provider, model)
+            if self._desired_reasoning:
+                self._request_reasoning(generation, self._desired_reasoning)
+            else:
+                self._finish_session_preferences(generation)
+        elif method == "config.set" and request_id in self._reasoning_requests:
+            generation, effort = self._reasoning_requests.pop(request_id)
+            if generation != self._preference_generation:
+                return
+            self.settings.reasoning_effort = effort
+            logging.getLogger("hal9000.hermes").info(
+                "HAL session reasoning selected: %s", effort
+            )
+            self.reasoningChanged.emit(effort)
+            self._finish_session_preferences(generation)
         elif method == "approval.respond":
             self.approvalResolved.emit("")
 
     def _on_rpc_error(
-        self, _request_id: str, method: str, message: str, _code: int
+        self, request_id: str, method: str, message: str, _code: int
     ) -> None:
         if method == "session.resume" and self._stored_session_id:
             self._stored_session_id = ""
             self._runtime_session_id = ""
             self._create_or_resume_session()
             return
+        model_workflow = self._model_switch_requests.pop(request_id, None)
+        reasoning_workflow = self._reasoning_requests.pop(request_id, None)
+        if method == "model.options":
+            self.modelOperationError.emit(message)
+            return
+        workflow = model_workflow or reasoning_workflow
+        if workflow:
+            generation = workflow[0]
+            if generation != self._preference_generation:
+                return
+            self.modelOperationError.emit(message)
+            self._fail_preference_workflow(generation, message)
+            return
         self.errorOccurred.emit(message)
+
+    def _finish_session_preferences(
+        self,
+        generation: int | None = None,
+        deliver_queued: bool = True,
+        failure: str = "",
+    ) -> None:
+        active_generation = self._preference_generation if generation is None else generation
+        if active_generation != self._preference_generation:
+            return
+        self._preferences_pending = False
+        self._preferences_failed = not deliver_queued
+        self._preference_state = "ready" if deliver_queued else "failed"
+        # A disconnected client reports request errors synchronously. Avoid a
+        # model.options -> error -> finish -> model.options recursion while the
+        # transport is unwinding.
+        if self.client.connected:
+            self.requestModelOptions()
+        queued = self._queued_prompt
+        self._queued_prompt = ""
+        if queued and deliver_queued:
+            self.sendPrompt(queued)
+        elif queued:
+            self.errorOccurred.emit(
+                "HAL did not send the prompt because its Hermes session model "
+                f"could not be applied: {failure or 'unknown model error'}"
+            )
+
+    def _fail_preference_workflow(self, generation: int, message: str) -> None:
+        self._finish_session_preferences(
+            generation,
+            deliver_queued=False,
+            failure=message,
+        )
 
     def _on_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
@@ -314,13 +566,19 @@ class HermesService(QObject):
             self.integrationsChanged.emit(sorted(map(str, tools.keys())))
         elif event_type == "message.start":
             self.assistantStarted.emit(str(payload.get("message_id") or payload.get("id") or ""))
-        elif event_type in {"message.delta", "message.interim"}:
+        elif event_type == "message.delta":
             self.assistantDelta.emit(
                 str(payload.get("delta") or payload.get("text") or payload.get("content") or "")
             )
+        elif event_type == "message.interim":
+            self.assistantInterim.emit(
+                str(payload.get("text") or payload.get("content") or ""),
+                bool(payload.get("already_streamed")),
+            )
         elif event_type == "message.complete":
             self.assistantCompleted.emit(
-                str(payload.get("text") or payload.get("content") or payload.get("message") or "")
+                str(payload.get("text") or payload.get("content") or payload.get("message") or ""),
+                bool(payload.get("response_previewed")),
             )
             self.turnFinished.emit()
         elif event_type.startswith("tool."):

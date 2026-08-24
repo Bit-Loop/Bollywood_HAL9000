@@ -69,7 +69,7 @@ class _WebSocketWorker:
 
         attempt = 0
         while not self.stop_event.is_set():
-            self.on_state("connecting" if attempt == 0 else "reconnecting")
+            self._notify(self.on_state, "connecting" if attempt == 0 else "reconnecting")
             try:
                 with connect(
                     self.url,
@@ -81,21 +81,21 @@ class _WebSocketWorker:
                     with self._socket_lock:
                         self._socket = socket
                     attempt = 0
-                    self.on_state("connected")
+                    self._notify(self.on_state, "connected")
                     self._pump(socket)
             except Exception as exc:
                 if not self.stop_event.is_set():
-                    self.on_error(str(exc))
+                    self._notify(self.on_error, str(exc))
             finally:
                 with self._socket_lock:
                     self._socket = None
             if self.stop_event.is_set():
                 break
             attempt += 1
-            self.on_state("reconnecting")
+            self._notify(self.on_state, "reconnecting")
             delay = min(15.0, 0.5 * (2 ** min(attempt - 1, 5)))
             self.stop_event.wait(delay)
-        self.on_state("offline")
+        self._notify(self.on_state, "offline")
 
     def _pump(self, socket) -> None:
         from websockets.exceptions import ConnectionClosed
@@ -117,7 +117,15 @@ class _WebSocketWorker:
                 return
             if isinstance(message, bytes):
                 message = message.decode("utf-8", errors="replace")
-            self.on_message(str(message))
+            self._notify(self.on_message, str(message))
+
+    def _notify(self, callback: Callable[[str], None], value: str) -> None:
+        try:
+            callback(value)
+        except RuntimeError:
+            # Qt may destroy the signal owner while a socket shutdown is still
+            # unwinding. The worker is already obsolete at that point.
+            self.stop_event.set()
 
 
 class HermesGatewayClient(QObject):

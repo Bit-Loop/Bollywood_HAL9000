@@ -19,9 +19,16 @@ class HermesProcessManager(QObject):
 
     READY_PATTERN = re.compile(r"HERMES_(?:BACKEND|DASHBOARD)_READY\s+port=(\d+)")
 
-    def __init__(self, executable: Path, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        executable: Path,
+        parent: QObject | None = None,
+        *,
+        profile: str = "",
+    ) -> None:
         super().__init__(parent)
         self.executable = executable
+        self.profile = profile.strip()
         self._process = QProcess(self)
         self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._process.readyReadStandardOutput.connect(self._read_output)
@@ -54,9 +61,10 @@ class HermesProcessManager(QObject):
         environment.insert("HERMES_PARENT_PID", str(os.getpid()))
         self._process.setProcessEnvironment(environment)
         self._process.setProgram(str(self.executable))
-        self._process.setArguments(
-            ["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"]
-        )
+        arguments = ["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"]
+        if self.profile:
+            arguments[0:0] = ["--profile", self.profile]
+        self._process.setArguments(arguments)
         self._process.start()
         self.runningChanged.emit(True)
 

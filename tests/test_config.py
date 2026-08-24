@@ -16,13 +16,27 @@ def paths_for(tmp_path) -> AppPaths:
     )
 
 
+def test_defaults_use_subscription_sol_without_local_advisors_or_xtts() -> None:
+    config = AppConfig()
+
+    assert config.hermes.profile == "codex-cloud"
+    assert config.hermes.provider == "openai-codex"
+    assert config.hermes.model == "gpt-5.6-sol"
+    assert config.hermes.reasoning_effort == "medium"
+    assert config.voice.mode == "piper"
+    assert config.voice.selected_engine == "Piper"
+
+
 def test_configuration_round_trip_and_atomic_replace(tmp_path) -> None:
     paths = paths_for(tmp_path)
     store = ConfigStore(paths)
     config = AppConfig()
     config.general.setup_complete = True
     config.general.window_width = 1234
+    config.general.zip_code = "60601-1234"
     config.hermes.last_session_id = "session-key"
+    config.hermes.provider = "copilot"
+    config.hermes.model = "gpt-5.6"
     config.wake.phrase = "Hey HAL"
     config.voice.benchmark_results = {"XTTS": [{"synthesized": True}]}
 
@@ -30,11 +44,14 @@ def test_configuration_round_trip_and_atomic_replace(tmp_path) -> None:
     restored = store.load()
 
     assert restored.general.window_width == 1234
+    assert restored.general.zip_code == "60601-1234"
     assert restored.hermes.last_session_id == "session-key"
+    assert restored.hermes.provider == "copilot"
+    assert restored.hermes.model == "gpt-5.6"
     assert restored.wake.phrase == "hey hal"
     assert restored.voice.benchmark_results["XTTS"][0]["synthesized"] is True
     assert not list(paths.config.glob("*.tmp"))
-    assert json.loads(paths.config_file.read_text())["version"] == 1
+    assert json.loads(paths.config_file.read_text())["version"] == 3
 
 
 def test_invalid_values_are_normalized(tmp_path) -> None:
@@ -48,6 +65,54 @@ def test_invalid_values_are_normalized(tmp_path) -> None:
     config = ConfigStore(paths).load()
     assert config.general.launch_mode == "remember_last"
     assert config.general.window_width == 600
-    assert config.voice.mode == "auto"
+    assert config.voice.mode == "piper"
     assert config.voice.volume == 1.0
     assert config.wake.sensitivity == 0.0
+
+
+def test_v2_latency_and_model_defaults_migrate_without_overwriting_explicit_xtts(
+    tmp_path,
+) -> None:
+    paths = paths_for(tmp_path)
+    paths.ensure()
+    paths.config_file.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "hermes": {
+                    "profile": "",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "medium",
+                },
+                "voice": {"mode": "auto", "selected_engine": "XTTS"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = ConfigStore(paths).load()
+
+    assert migrated.version == 3
+    assert migrated.hermes.profile == "codex-cloud"
+    assert migrated.hermes.model == "gpt-5.6-sol"
+    assert migrated.voice.mode == "piper"
+    assert migrated.voice.selected_engine == "Piper"
+
+    paths.config_file.write_text(
+        json.dumps({"version": 2, "voice": {"mode": "xtts"}}),
+        encoding="utf-8",
+    )
+    explicit = ConfigStore(paths).load()
+    assert explicit.voice.mode == "xtts"
+
+
+def test_postal_code_is_single_line_and_bounded(tmp_path) -> None:
+    paths = paths_for(tmp_path)
+    store = ConfigStore(paths)
+    config = AppConfig()
+    config.general.zip_code = "  ab12 3cd\nignore-this-tail  "
+
+    store.save(config)
+
+    assert store.load().general.zip_code == "AB12 3CD"

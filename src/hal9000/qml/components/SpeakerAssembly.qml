@@ -28,10 +28,10 @@ Item {
 
     Rectangle {
         anchors.fill: parent
-        color: "#0a0b0b"
-        border.width: Math.max(1, width * 0.003)
-        border.color: "#4b4d49"
-        radius: Math.max(2, width * 0.008)
+        color: "#090a0a"
+        border.width: Math.max(1, width * 0.004)
+        border.color: "#b9bab5"
+        radius: Math.max(1, width * 0.004)
     }
 
     ManualDrawer {
@@ -87,31 +87,34 @@ Item {
                 const ctx = getContext("2d")
                 ctx.reset()
                 const bg = ctx.createLinearGradient(0, 0, width, 0)
-                bg.addColorStop(0, "#101111")
-                bg.addColorStop(0.18, "#292a29")
-                bg.addColorStop(0.5, "#1c1d1c")
-                bg.addColorStop(0.82, "#2a2b29")
-                bg.addColorStop(1, "#0d0e0e")
+                bg.addColorStop(0, "#656762")
+                bg.addColorStop(0.05, "#d2d3ce")
+                bg.addColorStop(0.24, "#9b9d98")
+                bg.addColorStop(0.52, "#d7d8d3")
+                bg.addColorStop(0.78, "#92948f")
+                bg.addColorStop(0.96, "#d6d7d2")
+                bg.addColorStop(1, "#5c5e5a")
                 ctx.fillStyle = bg
                 ctx.fillRect(0, 0, width, height)
-                ctx.strokeStyle = "#555752"
+                ctx.strokeStyle = "#e2e3de"
                 ctx.lineWidth = Math.max(1, width * 0.003)
                 ctx.strokeRect(1, 1, width - 2, height - 2)
 
-                const margin = Math.max(14, width * 0.04)
-                const gapX = Math.max(8, Math.min(15, width / 62))
-                const gapY = Math.max(8, Math.min(15, height / 30))
-                const radius = Math.max(1.2, Math.min(2.8, gapX * 0.24))
+                const marginX = Math.max(7, width * 0.025)
+                const marginY = Math.max(9, height * 0.07)
+                const gapX = Math.max(6, Math.min(11, width / 48))
+                const gapY = Math.max(6, Math.min(10, height / 22))
+                const radius = Math.max(1.1, Math.min(2.2, gapX * 0.22))
                 let row = 0
-                for (let y = margin; y < height - margin; y += gapY) {
+                for (let y = marginY; y < height - marginY; y += gapY) {
                     const offset = row % 2 ? gapX / 2 : 0
-                    for (let x = margin + offset; x < width - margin; x += gapX) {
+                    for (let x = marginX + offset; x < width - marginX; x += gapX) {
                         const position = 1 - y / Math.max(1, height)
                         const active = root.visualizationEnabled && root.currentState === "SPEAKING"
                                      && position < grille.meter * 0.82
-                        ctx.fillStyle = active ? "rgba(118,22,22,0.58)" : "#050606"
-                        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill()
-                        ctx.strokeStyle = "rgba(180,182,175,0.1)"
+                        ctx.fillStyle = active ? "rgba(99,14,15,0.86)" : "#111212"
+                        ctx.beginPath(); ctx.ellipse(x, y, radius * 1.35, radius, 0, 0, Math.PI * 2); ctx.fill()
+                        ctx.strokeStyle = "rgba(255,255,250,0.38)"
                         ctx.lineWidth = 0.5
                         ctx.stroke()
                     }
@@ -121,11 +124,19 @@ Item {
         }
 
         Rectangle {
-            anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
-            height: Math.max(5, parent.height * 0.025)
-            color: "#080909"
+            anchors { left: parent.left; right: parent.right; top: parent.top }
+            height: Math.max(4, parent.height * 0.025)
+            color: "#d0d1cc"
             border.width: 1
-            border.color: "#3c3e3b"
+            border.color: "#50524f"
+        }
+
+        Rectangle {
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+            height: Math.max(5, parent.height * 0.03)
+            color: "#b9bab5"
+            border.width: 1
+            border.color: "#3b3d3b"
         }
 
         MouseArea {
@@ -141,7 +152,7 @@ Item {
         height: 6
         anchors.horizontalCenter: parent.horizontalCenter
         y: face.y + face.height - 3
-        color: "#737570"
+        color: "#d0d1cc"
         border.width: 1
         border.color: "#171817"
         radius: 1
@@ -152,6 +163,12 @@ Item {
             cursorShape: Qt.PointingHandCursor
             onClicked: root.grilleClicked()
         }
+    }
+
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        onClicked: mouse => mouse.accepted = true
     }
 
     function focusPrompt() {

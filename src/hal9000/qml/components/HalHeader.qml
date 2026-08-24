@@ -4,59 +4,94 @@ import "."
 Item {
     id: root
     property real scaleFactor: 1.0
-    implicitHeight: 180
+    implicitHeight: 72
 
     Rectangle {
         id: badge
-        width: Math.min(parent.width * 0.62, 520 * root.scaleFactor)
-        height: Math.min(parent.height * 0.75, width * 0.31)
-        anchors.centerIn: parent
-        radius: Math.max(2, width * 0.012)
-        color: HalTheme.black
-        border.width: Math.max(1, width * 0.006)
-        border.color: "#9a9b96"
+        anchors.fill: parent
+        radius: Math.max(1, width * 0.006)
+        color: "#050606"
+        border.width: Math.max(1, width * 0.008)
+        border.color: "#aeb1ad"
 
         Rectangle {
             anchors.fill: parent
-            anchors.margins: Math.max(3, parent.width * 0.012)
-            color: "#0b0b0b"
+            anchors.margins: Math.max(2, parent.width * 0.009)
+            color: "#050606"
             border.width: 1
-            border.color: "#353634"
-            radius: Math.max(1, parent.radius - 1)
+            border.color: "#171919"
         }
 
-        Row {
-            anchors.centerIn: parent
-            spacing: badge.width * 0.04
-
-            Text {
-                text: "HAL"
-                color: HalTheme.text
-                font.family: HalTheme.displayFont
-                font.pixelSize: badge.height * 0.46
-                font.weight: Font.Black
-                font.italic: true
-                font.letterSpacing: badge.width * 0.006
-                anchors.verticalCenter: parent.verticalCenter
+        Rectangle {
+            id: blueField
+            objectName: "headerBlueField"
+            anchors {
+                left: parent.left
+                top: parent.top
+                bottom: parent.bottom
+                margins: Math.max(3, parent.width * 0.014)
             }
-
-            Rectangle {
-                width: 1
-                height: badge.height * 0.43
-                color: HalTheme.steel
-                anchors.verticalCenter: parent.verticalCenter
-            }
-
-            Text {
-                text: "9000"
-                color: HalTheme.text
-                font.family: HalTheme.displayFont
-                font.pixelSize: badge.height * 0.31
-                font.weight: Font.DemiBold
-                font.italic: true
-                font.letterSpacing: badge.width * 0.003
-                anchors.verticalCenter: parent.verticalCenter
+            width: parent.width * 0.52
+            color: "#4e9ac7"
+            gradient: Gradient {
+                orientation: Gradient.Vertical
+                GradientStop { position: 0.0; color: "#5eb2db" }
+                GradientStop { position: 0.48; color: "#529fca" }
+                GradientStop { position: 1.0; color: "#4287b2" }
             }
         }
+
+        Rectangle {
+            id: blackField
+            objectName: "headerBlackField"
+            anchors {
+                left: blueField.right
+                right: parent.right
+                top: blueField.top
+                bottom: blueField.bottom
+                rightMargin: Math.max(3, parent.width * 0.014)
+            }
+            color: "#090a0a"
+        }
+
+        Text {
+            objectName: "headerHalLabel"
+            text: "HAL"
+            color: "#f0f0eb"
+            style: Text.Outline
+            styleColor: "#5f6260"
+            font.family: "DejaVu Sans Condensed"
+            font.pixelSize: badge.height * 0.48
+            font.weight: Font.Medium
+            font.letterSpacing: badge.width * 0.004
+            anchors.centerIn: blueField
+        }
+
+        Text {
+            objectName: "header9000Label"
+            text: "9000"
+            color: "#111313"
+            style: Text.Outline
+            styleColor: "#d6d7d2"
+            font.family: "DejaVu Sans Condensed"
+            font.pixelSize: badge.height * 0.48
+            font.weight: Font.Medium
+            font.letterSpacing: badge.width * 0.002
+            anchors.centerIn: blackField
+        }
+
+        Rectangle {
+            width: Math.max(2, badge.width * 0.008)
+            height: width
+            radius: width / 2
+            anchors { right: parent.right; rightMargin: badge.width * 0.035; bottom: parent.bottom; bottomMargin: badge.height * 0.17 }
+            color: "#b6b8b3"
+        }
+    }
+
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        onClicked: mouse => mouse.accepted = true
     }
 }

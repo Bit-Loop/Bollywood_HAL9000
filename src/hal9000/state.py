@@ -38,7 +38,7 @@ ACTIVE_STATES = frozenset(
 
 ALLOWED_TRANSITIONS: dict[HalState, frozenset[HalState]] = {
     HalState.BOOTING: frozenset({HalState.STANDBY, HalState.MANUAL, HalState.ERROR, HalState.DISABLED}),
-    HalState.STANDBY: frozenset({HalState.WAKE_DETECTED, HalState.LISTENING, HalState.MANUAL, HalState.ERROR, HalState.DISABLED}),
+    HalState.STANDBY: frozenset({HalState.WAKE_DETECTED, HalState.LISTENING, HalState.THINKING, HalState.TOOL_RUNNING, HalState.SPEAKING, HalState.MANUAL, HalState.ERROR, HalState.DISABLED}),
     HalState.WAKE_DETECTED: frozenset({HalState.LISTENING, HalState.MANUAL, HalState.ERROR, HalState.STANDBY}),
     HalState.LISTENING: frozenset({HalState.TRANSCRIBING, HalState.THINKING, HalState.MANUAL, HalState.ERROR, HalState.STANDBY}),
     HalState.TRANSCRIBING: frozenset({HalState.THINKING, HalState.LISTENING, HalState.MANUAL, HalState.ERROR, HalState.STANDBY}),
@@ -46,7 +46,7 @@ ALLOWED_TRANSITIONS: dict[HalState, frozenset[HalState]] = {
     HalState.TOOL_RUNNING: frozenset({HalState.THINKING, HalState.WAITING_APPROVAL, HalState.SPEAKING, HalState.MANUAL, HalState.ERROR, HalState.STANDBY}),
     HalState.WAITING_APPROVAL: frozenset({HalState.THINKING, HalState.TOOL_RUNNING, HalState.SPEAKING, HalState.MANUAL, HalState.ERROR}),
     HalState.SPEAKING: frozenset({HalState.LISTENING, HalState.MANUAL, HalState.STANDBY, HalState.ERROR}),
-    HalState.MANUAL: frozenset({HalState.LISTENING, HalState.TRANSCRIBING, HalState.THINKING, HalState.TOOL_RUNNING, HalState.WAITING_APPROVAL, HalState.SPEAKING, HalState.STANDBY, HalState.ERROR, HalState.DISABLED}),
+    HalState.MANUAL: frozenset({HalState.WAKE_DETECTED, HalState.LISTENING, HalState.TRANSCRIBING, HalState.THINKING, HalState.TOOL_RUNNING, HalState.WAITING_APPROVAL, HalState.SPEAKING, HalState.STANDBY, HalState.ERROR, HalState.DISABLED}),
     HalState.ERROR: frozenset({HalState.BOOTING, HalState.STANDBY, HalState.MANUAL, HalState.DISABLED}),
     HalState.DISABLED: frozenset({HalState.BOOTING, HalState.STANDBY, HalState.MANUAL}),
 }

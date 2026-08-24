@@ -20,10 +20,12 @@ from hal9000.clicks import SpeakerClickAggregator
 from hal9000.config import AppConfig, ConfigStore
 from hal9000.diagnostics import DiagnosticsRunner
 from hal9000.hermes.service import HermesService
+from hal9000.location import prompt_with_location
 from hal9000.models import ActivityModel, ApprovalModel, ConversationModel
 from hal9000.paths import AppPaths
 from hal9000.secrets import SecretStore
 from hal9000.speech.stt import FasterWhisperService
+from hal9000.speech.text import SpeechChunker
 from hal9000.speech.tts.manager import TtsManager
 from hal9000.speech.wake_service import WakeWordService
 from hal9000.state import HalState, HalStateMachine, InvalidTransition
@@ -47,6 +49,7 @@ class HalController(QObject):
     modelProgressChanged = Signal()
     credentialChanged = Signal()
     recentErrorsChanged = Signal()
+    hermesModelsChanged = Signal()
     _cudaDetected = Signal(str)
 
     def __init__(
@@ -110,6 +113,14 @@ class HalController(QObject):
         self._diagnostics: dict[str, Any] = {}
         self._assistant_row = -1
         self._assistant_text = ""
+        self._assistant_received_delta = False
+        self._assistant_segment_text = ""
+        self._assistant_interim_texts: list[str] = []
+        self._assistant_complete_received = False
+        self._speech_chunker = SpeechChunker()
+        self._speech_pending = 0
+        self._speech_turn_finished = True
+        self._speech_suppressed = False
         self._voice_conversation = False
         self._capture_origin = ""
         self._startup_complete = False
@@ -118,10 +129,14 @@ class HalController(QObject):
         self._model_task = ""
         self._model_progress = 0.0
         self._recent_errors: list[str] = []
+        self._hermes_models: list[dict[str, Any]] = []
+        self._hermes_model_provider = config.hermes.provider
+        self._hermes_model_name = config.hermes.model
         self._cuda_status = "not probed"
         self._manual_idle_timer = QTimer(self)
         self._manual_idle_timer.setSingleShot(True)
         self._manual_idle_timer.timeout.connect(self._manual_idle_timeout)
+        self._scheduled_timers: set[QTimer] = set()
         self._cudaDetected.connect(self._set_cuda_status)
         self._connect_signals()
 
@@ -130,9 +145,14 @@ class HalController(QObject):
         self.hermes.versionChanged.connect(lambda _value: self.subsystemChanged.emit())
         self.hermes.latencyChanged.connect(lambda _value: self.subsystemChanged.emit())
         self.hermes.integrationsChanged.connect(self._set_integrations)
+        self.hermes.modelOptionsReady.connect(self._set_hermes_model_options)
+        self.hermes.modelChanged.connect(self._hermes_model_changed)
+        self.hermes.reasoningChanged.connect(self._hermes_reasoning_changed)
+        self.hermes.modelOperationError.connect(self._model_operation_error)
         self.hermes.sessionChanged.connect(self._hermes_session_changed)
         self.hermes.assistantStarted.connect(self._assistant_started)
         self.hermes.assistantDelta.connect(self._assistant_delta)
+        self.hermes.assistantInterim.connect(self._assistant_interim)
         self.hermes.assistantCompleted.connect(self._assistant_completed)
         self.hermes.toolActivity.connect(self._tool_activity)
         self.hermes.approvalRequested.connect(self._approval_requested)
@@ -151,7 +171,7 @@ class HalController(QObject):
         self.stt.transcriptionReady.connect(self._transcription_ready)
         self.stt.errorOccurred.connect(self._stt_error)
         self.tts.statusChanged.connect(lambda _value: self.subsystemChanged.emit())
-        self.tts.activeEngineChanged.connect(lambda _value: self.subsystemChanged.emit())
+        self.tts.activeEngineChanged.connect(self._tts_engine_changed)
         self.tts.engineStatusChanged.connect(self.subsystemChanged.emit)
         self.tts.progressChanged.connect(self._tts_progress)
         self.tts.synthesisReady.connect(self._synthesis_ready)
@@ -247,7 +267,7 @@ class HalController(QObject):
 
     @Property(str, notify=subsystemChanged)
     def ttsEngine(self) -> str:
-        return self.tts.activeEngine or "AUTO / XTTS PREFERRED"
+        return self.tts.activeEngine or "PIPER / LOW LATENCY"
 
     @Property(str, notify=subsystemChanged)
     def xttsStatus(self) -> str:
@@ -289,13 +309,38 @@ class HalController(QObject):
     def recentErrors(self) -> list[str]:
         return list(self._recent_errors)
 
+    @Property("QVariantList", notify=hermesModelsChanged)
+    def hermesModels(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._hermes_models]
+
+    @Property(int, notify=hermesModelsChanged)
+    def hermesModelIndex(self) -> int:
+        for index, item in enumerate(self._hermes_models):
+            if (
+                item.get("provider") == self._hermes_model_provider
+                and item.get("model") == self._hermes_model_name
+            ):
+                return index
+        return -1
+
+    @Property(str, notify=hermesModelsChanged)
+    def hermesModelLabel(self) -> str:
+        if not self._hermes_model_name:
+            return "WAITING FOR HERMES"
+        return (
+            f"{self._hermes_model_provider} // {self._hermes_model_name} // "
+            f"{self.config.hermes.reasoning_effort.upper()}"
+            if self._hermes_model_provider
+            else self._hermes_model_name
+        )
+
     @Slot()
     def startup(self) -> None:
         if self._startup_complete:
             return
         self._startup_complete = True
         if not self._services_enabled:
-            QTimer.singleShot(100, self._finish_boot)
+            self._schedule(100, self._finish_boot)
             return
         self.audio_devices.refresh()
         threading.Thread(
@@ -308,12 +353,16 @@ class HalController(QObject):
             self.wake.start()
         else:
             self.audio.start(self.config.stt.input_device or self.config.wake.input_device)
-        QTimer.singleShot(450, self._finish_boot)
+        self._schedule(450, self._finish_boot)
         if not self._first_run:
-            QTimer.singleShot(800, self.tts.preload)
+            self._schedule(800, self.tts.preload)
 
     @Slot()
     def shutdown(self) -> None:
+        for timer in tuple(self._scheduled_timers):
+            timer.stop()
+            timer.deleteLater()
+        self._scheduled_timers.clear()
         self.playback.stop()
         self.audio.stop()
         self.hermes.close()
@@ -334,7 +383,7 @@ class HalController(QObject):
         except InvalidTransition as exc:
             logging.getLogger("hal9000.controller").debug("Open manual deferred: %s", exc)
         self.touchManual()
-        QTimer.singleShot(380, self.focusInputRequested.emit)
+        self._schedule(380, self.focusInputRequested.emit)
 
     @Slot()
     def closeManual(self) -> None:
@@ -354,6 +403,8 @@ class HalController(QObject):
         self._settings_open = True
         self._manual_idle_timer.stop()
         self.settingsOpenChanged.emit(True)
+        if self.hermes.status == "connected":
+            self.hermes.requestModelOptions()
 
     @Slot()
     def closeSettings(self) -> None:
@@ -375,6 +426,12 @@ class HalController(QObject):
         clean = text.strip()
         if not clean:
             return
+        self._cancel_speech_output()
+        self._assistant_complete_received = False
+        self._speech_turn_finished = False
+        self._assistant_received_delta = False
+        self._assistant_segment_text = ""
+        self._assistant_interim_texts.clear()
         self.touchManual()
         if not self.manualOpen and self._capture_origin != "wake":
             self.openManual()
@@ -382,7 +439,9 @@ class HalController(QObject):
         self._assistant_row = -1
         self._assistant_text = ""
         self._transition(HalState.THINKING, "prompt submitted")
-        self.hermes.sendPrompt(clean)
+        self.hermes.sendPrompt(
+            prompt_with_location(clean, self.config.general.zip_code)
+        )
 
     @Slot()
     def toggleManualMic(self) -> None:
@@ -397,12 +456,15 @@ class HalController(QObject):
 
     @Slot()
     def stopGeneration(self) -> None:
+        self._cancel_speech_output(suppress=True)
         self.hermes.cancel()
         self.state_machine.return_to_rest("generation stopped")
 
     @Slot()
     def stopSpeech(self) -> None:
-        self.playback.stop()
+        self._voice_conversation = False
+        self._cancel_speech_output(suppress=True)
+        self.state_machine.return_to_rest("speech stopped")
 
     @Slot()
     def toggleMicrophoneMute(self) -> None:
@@ -464,6 +526,14 @@ class HalController(QObject):
     def reconnectHermes(self) -> None:
         self.hermes.reconnect()
 
+    @Slot()
+    def refreshHermesModels(self) -> None:
+        self.hermes.requestModelOptions(True)
+
+    @Slot(str, str)
+    def selectHermesModel(self, provider: str, model: str) -> None:
+        self.hermes.switchModel(provider, model)
+
     @Slot(str)
     def setHermesToken(self, token: str) -> None:
         clean = token.strip()
@@ -518,6 +588,10 @@ class HalController(QObject):
 
     @Slot(str)
     def testVoice(self, engine: str) -> None:
+        self._cancel_speech_output()
+        self._assistant_complete_received = True
+        self._speech_turn_finished = False
+        self._speech_pending = 1
         self.tts.speakWith(engine, "I'm sorry, I can't do that.")
 
     @Slot()
@@ -540,7 +614,7 @@ class HalController(QObject):
             }
         )
 
-    @Slot(str, object)
+    @Slot(str, "QVariant")
     def updateSetting(self, dotted: str, value: object) -> None:
         sections = {
             "general": self.config.general,
@@ -609,13 +683,18 @@ class HalController(QObject):
         self._voice_conversation = True
         self._capture_origin = "wake"
         self._transition(HalState.WAKE_DETECTED, "hey hal")
-        QTimer.singleShot(180, self._begin_wake_recording)
+        self._schedule(180, self._begin_wake_recording)
 
     def _begin_wake_recording(self) -> None:
         self._transition(HalState.LISTENING, "capture utterance")
         self.audio.startRecording()
 
     def _utterance_ready(self, samples: object) -> None:
+        if self.state_machine.current != HalState.LISTENING:
+            logging.getLogger("hal9000.controller").debug(
+                "Ignored stale utterance while in %s", self.state_machine.current.name
+            )
+            return
         try:
             size = len(samples)
         except TypeError:
@@ -636,33 +715,89 @@ class HalController(QObject):
         self.sendText(clean)
 
     def _assistant_started(self, _message_id: str) -> None:
+        self.tts.cancelPending()
+        self.playback.stop()
+        self._speech_chunker.reset()
+        self._speech_pending = 0
+        self._assistant_received_delta = False
+        self._assistant_segment_text = ""
+        self._assistant_interim_texts.clear()
+        self._assistant_complete_received = False
+        self._speech_turn_finished = False
+        self._speech_suppressed = False
         self._assistant_text = ""
         self._assistant_row = self._append_message("assistant", "", streaming=True)
+        if self.state_machine.current == HalState.STANDBY:
+            self._transition(HalState.THINKING, "Hermes response resumed")
 
     def _assistant_delta(self, delta: str) -> None:
         if self._assistant_row < 0:
             self._assistant_started("")
         self._assistant_text += delta
+        self._assistant_segment_text += delta
+        self._assistant_received_delta = True
         self.conversations.update(
             self._assistant_row,
             {"text": self._assistant_text, "streaming": True},
         )
+        self._queue_speech_chunks(self._speech_chunker.feed(delta))
 
-    def _assistant_completed(self, text: str) -> None:
-        final = text.strip() or self._assistant_text.strip()
+    def _assistant_interim(self, text: str, already_streamed: bool) -> None:
+        authoritative = text.strip()
+        if not authoritative:
+            return
+        if self._assistant_row < 0:
+            self._assistant_started("")
+
+        if not already_streamed and authoritative not in self._assistant_interim_texts:
+            streamed_segment = self._assistant_segment_text.strip()
+            if streamed_segment and authoritative.startswith(streamed_segment):
+                missing = authoritative[len(streamed_segment) :]
+                self._assistant_text += missing
+                self._queue_speech_chunks(self._speech_chunker.feed(missing))
+            elif authoritative not in self._assistant_text:
+                separator = "\n\n" if self._assistant_text.strip() else ""
+                self._assistant_text += separator + authoritative
+                self._queue_speech_chunks(self._speech_chunker.feed(authoritative))
+
+        # An interim frame seals one Hermes segment. Flushing here releases a
+        # trailing phrase early without replaying text marked already_streamed.
+        self._queue_speech_chunks(self._speech_chunker.finish())
+        self._assistant_interim_texts.append(authoritative)
+        self._assistant_segment_text = ""
+        self.conversations.update(
+            self._assistant_row,
+            {"text": self._assistant_text or authoritative, "streaming": True},
+        )
+
+    def _assistant_completed(self, text: str, response_previewed: bool = False) -> None:
+        streamed = self._assistant_text
+        current_segment = self._assistant_segment_text.strip()
+        final = text.strip() or streamed.strip()
         if self._assistant_row < 0:
             self._assistant_row = self._append_message("assistant", final)
         else:
             self.conversations.update(
                 self._assistant_row,
                 {"text": final, "streaming": False},
-            )
+        )
         self._assistant_text = final
-        if final:
-            self._transition(HalState.SPEAKING, "response ready")
-            self.tts.speak(final)
-        else:
-            self.state_machine.return_to_rest("empty response")
+        final_was_interim = final in self._assistant_interim_texts
+        if final and not response_previewed and not final_was_interim:
+            if not current_segment:
+                self._queue_speech_chunks(self._speech_chunker.feed(final))
+            elif final.startswith(current_segment):
+                self._queue_speech_chunks(
+                    self._speech_chunker.feed(final[len(current_segment) :])
+                )
+            elif final != current_segment:
+                self._queue_speech_chunks(self._speech_chunker.finish())
+                self._speech_chunker.reset()
+                self._queue_speech_chunks(self._speech_chunker.feed(final))
+        self._queue_speech_chunks(self._speech_chunker.finish())
+        self._assistant_segment_text = ""
+        self._assistant_complete_received = True
+        self._maybe_finish_speech()
 
     def _tool_activity(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "tool.progress")
@@ -712,7 +847,11 @@ class HalController(QObject):
             self.state_machine.enterManual()
         self._transition(HalState.WAITING_APPROVAL, "Hermes safeguard")
 
-    def _synthesis_ready(self, audio: object) -> None:
+    def _synthesis_ready(self, audio: object, generation: int) -> None:
+        if self._speech_suppressed or generation != self.tts.speechGeneration:
+            return
+        self._speech_pending = max(0, self._speech_pending - 1)
+        self._transition(HalState.SPEAKING, "streamed response audio ready")
         self.audio.setSpeaking(True)
         self.playback.play(audio)
 
@@ -721,12 +860,43 @@ class HalController(QObject):
             self._transition(HalState.SPEAKING, "audio playback")
 
     def _playback_finished(self) -> None:
+        self._maybe_finish_speech()
+
+    def _queue_speech_chunks(self, chunks: list[str]) -> None:
+        if self._speech_suppressed:
+            return
+        for chunk in chunks:
+            clean = chunk.strip()
+            if not clean:
+                continue
+            self._speech_pending += 1
+            self.tts.speak(clean)
+
+    def _maybe_finish_speech(self) -> None:
+        if (
+            self._speech_turn_finished
+            or not self._assistant_complete_received
+            or self._speech_pending > 0
+            or self.playback.playing
+        ):
+            return
+        self._speech_turn_finished = True
         self.audio.setSpeaking(False)
         if self._voice_conversation and not self.manualOpen:
-            QTimer.singleShot(650, self._continue_voice_conversation)
+            self._schedule(650, self._continue_voice_conversation)
         else:
             self.state_machine.return_to_rest("speech complete")
             self.touchManual()
+
+    def _cancel_speech_output(self, suppress: bool = False) -> None:
+        self._speech_turn_finished = True
+        self._speech_suppressed = suppress
+        self._assistant_complete_received = True
+        self._speech_pending = 0
+        self._speech_chunker.reset()
+        self.tts.cancelPending()
+        self.playback.stop()
+        self.audio.setSpeaking(False)
 
     def _continue_voice_conversation(self) -> None:
         if not self._voice_conversation or self.manualOpen:
@@ -748,8 +918,17 @@ class HalController(QObject):
             self._complete_first_run()
 
     def _tts_fallback(self, reason: str) -> None:
+        logging.getLogger("hal9000.tts").info("%s", reason)
         self.config.voice.last_fallback_reason = reason
         self._save_config()
+        self.subsystemChanged.emit()
+
+    def _tts_engine_changed(self, engine: str) -> None:
+        logging.getLogger("hal9000.tts").info("HAL voice engine active: %s", engine)
+        if engine == "XTTS" and self.config.voice.last_fallback_reason:
+            self.config.voice.last_fallback_reason = ""
+            self._save_config()
+            self.configChanged.emit()
         self.subsystemChanged.emit()
 
     def _error(self, message: str) -> None:
@@ -776,6 +955,11 @@ class HalController(QObject):
     def _tts_error(self, message: str) -> None:
         self._record_error("Speech output: " + message)
         self.notification.emit("Speech output unavailable: " + message)
+        self.tts.cancelPending()
+        self._speech_pending = 0
+        self._assistant_complete_received = True
+        self._speech_turn_finished = True
+        self.playback.stop()
         self.audio.setSpeaking(False)
         self.state_machine.return_to_rest("TTS failure; text retained")
         if self._setup_in_progress:
@@ -800,6 +984,71 @@ class HalController(QObject):
     def _set_integrations(self, integrations: list[str]) -> None:
         self._integrations = list(integrations)
         self.integrationsChanged.emit()
+
+    def _set_hermes_model_options(self, payload: dict[str, Any]) -> None:
+        current_provider = str(payload.get("provider") or self._hermes_model_provider)
+        current_model = str(payload.get("model") or self._hermes_model_name)
+        options: list[dict[str, Any]] = []
+        for provider in payload.get("providers") or []:
+            if not isinstance(provider, dict):
+                continue
+            slug = str(provider.get("slug") or "").strip()
+            name = str(provider.get("name") or slug or "Hermes").strip()
+            for raw_model in provider.get("models") or []:
+                if isinstance(raw_model, dict):
+                    model = str(raw_model.get("id") or raw_model.get("name") or "").strip()
+                else:
+                    model = str(raw_model).strip()
+                if not model:
+                    continue
+                options.append(
+                    {
+                        "label": f"{name}  //  {model}",
+                        "provider": slug,
+                        "model": model,
+                    }
+                )
+        if current_model and not any(
+            item["provider"] == current_provider and item["model"] == current_model
+            for item in options
+        ):
+            options.insert(
+                0,
+                {
+                    "label": f"{current_provider or 'Hermes'}  //  {current_model}",
+                    "provider": current_provider,
+                    "model": current_model,
+                },
+            )
+        self._hermes_models = options
+        self._hermes_model_provider = current_provider
+        self._hermes_model_name = current_model
+        if current_model and not self.config.hermes.model:
+            self.config.hermes.provider = current_provider
+            self.config.hermes.model = current_model
+            self._save_config()
+            self.configChanged.emit()
+        self.hermesModelsChanged.emit()
+
+    def _hermes_model_changed(self, provider: str, model: str) -> None:
+        self._hermes_model_provider = provider
+        self._hermes_model_name = model
+        self.config.hermes.provider = provider
+        self.config.hermes.model = model
+        self._save_config()
+        self.configChanged.emit()
+        self.hermesModelsChanged.emit()
+        self.notification.emit(f"Hermes model selected: {model}")
+
+    def _hermes_reasoning_changed(self, effort: str) -> None:
+        self.config.hermes.reasoning_effort = effort
+        self._save_config()
+        self.configChanged.emit()
+        self.hermesModelsChanged.emit()
+
+    def _model_operation_error(self, message: str) -> None:
+        self._record_error("Hermes model: " + message)
+        self.notification.emit(message)
 
     def _detect_cuda(self) -> None:
         status = "CPU"
@@ -925,6 +1174,8 @@ class HalController(QObject):
             self.touchManual()
         elif dotted in {"hermes.mode", "hermes.backend_url", "hermes.profile", "hermes.auto_start"}:
             self.hermes.apply_settings()
+        elif dotted == "hermes.reasoning_effort":
+            self.hermes.setReasoning(self.config.hermes.reasoning_effort)
         elif dotted == "voice.mode":
             self.tts.set_mode(self.config.voice.mode)
         elif dotted == "voice.volume":
@@ -952,3 +1203,20 @@ class HalController(QObject):
             self.config_store.save(self.config)
         except OSError as exc:
             self.notification.emit(f"Could not save settings: {exc}")
+
+    def _schedule(self, milliseconds: int, callback) -> None:
+        """Run a callback later, cancelled automatically with this controller."""
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def run() -> None:
+            self._scheduled_timers.discard(timer)
+            try:
+                callback()
+            finally:
+                timer.deleteLater()
+
+        timer.timeout.connect(run)
+        self._scheduled_timers.add(timer)
+        timer.start(max(0, int(milliseconds)))

@@ -133,6 +133,19 @@ Rectangle {
                     }
                 }
                 SettingRow {
+                    label: "ZIP / postal code"
+                    detail: "Used only as coarse context for weather, nearby places, and other explicitly local requests."
+                    HalTextField {
+                        id: postalCodeField
+                        objectName: "postalCodeField"
+                        anchors.fill: parent
+                        text: root.snapshot.general ? root.snapshot.general.zip_code : ""
+                        placeholderText: "60601"
+                        maximumLength: 16
+                        onEditingFinished: controller.updateSetting("general.zip_code", text)
+                    }
+                }
+                SettingRow {
                     label: "Launch on login"
                     HalCheckBox {
                         anchors.centerIn: parent
@@ -175,8 +188,55 @@ Rectangle {
                     }
                 }
                 SettingRow {
+                    label: "Chat model"
+                    detail: "Pulled from authenticated Hermes providers. The choice applies only to this HAL session."
+                    RowLayout {
+                        anchors.fill: parent
+                        spacing: 5
+                        HalComboBox {
+                            id: hermesModelSelector
+                            objectName: "hermesModelSelector"
+                            Layout.fillWidth: true
+                            model: controller.hermesModels
+                            textRole: "label"
+                            currentIndex: controller.hermesModelIndex
+                            enabled: controller.hermesModels.length > 0
+                            onActivated: {
+                                const choice = controller.hermesModels[currentIndex]
+                                if (choice)
+                                    controller.selectHermesModel(choice.provider, choice.model)
+                            }
+                        }
+                        HalButton { text: "REFRESH"; onClicked: controller.refreshHermesModels() }
+                    }
+                }
+                SettingRow {
+                    label: "Reasoning effort"
+                    detail: "Session-scoped. This changes only HAL's selected Hermes model."
+                    HalComboBox {
+                        anchors.fill: parent
+                        model: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+                        currentIndex: Math.max(0, model.indexOf(root.snapshot.hermes ? root.snapshot.hermes.reasoning_effort : "medium"))
+                        onActivated: controller.updateSetting("hermes.reasoning_effort", currentText)
+                    }
+                }
+                SettingRow {
+                    label: "Active route"
+                    Text {
+                        anchors.fill: parent
+                        text: controller.hermesModelLabel
+                        color: HalTheme.muted
+                        font.family: HalTheme.controlFont
+                        font.pixelSize: 9
+                        elide: Text.ElideMiddle
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
                     label: "Backend mode"
                     HalComboBox {
+                        id: backendModeSelector
+                        objectName: "backendModeSelector"
                         anchors.fill: parent
                         model: ["local", "remote"]
                         currentIndex: Math.max(0, model.indexOf(root.snapshot.hermes ? root.snapshot.hermes.mode : "local"))
@@ -348,7 +408,7 @@ Rectangle {
 
             SettingsPage {
                 leftMargin: 22; rightMargin: 22
-                SettingSection { title: "HAL voice"; detail: "Auto strongly prefers XTTS when reliable. Piper remains warm as the runtime fallback." }
+                SettingSection { title: "HAL voice"; detail: "Piper is the low-latency default. XTTS remains available as an explicit high-fidelity option." }
                 SettingRow {
                     label: "Engine"
                     HalComboBox {

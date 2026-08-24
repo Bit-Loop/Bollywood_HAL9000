@@ -10,17 +10,17 @@ Item {
         color: root.baseColor
         gradient: Gradient {
             orientation: Gradient.Horizontal
-            GradientStop { position: 0.0; color: "#0d0e0e" }
-            GradientStop { position: 0.12; color: "#1b1c1c" }
-            GradientStop { position: 0.5; color: "#242525" }
-            GradientStop { position: 0.88; color: "#191a1a" }
-            GradientStop { position: 1.0; color: "#0b0c0c" }
+            GradientStop { position: 0.0; color: "#020202" }
+            GradientStop { position: 0.18; color: "#070707" }
+            GradientStop { position: 0.5; color: root.baseColor }
+            GradientStop { position: 0.82; color: "#070707" }
+            GradientStop { position: 1.0; color: "#020202" }
         }
     }
 
     Canvas {
         anchors.fill: parent
-        opacity: 0.22
+        opacity: 0.09
         onWidthChanged: requestPaint()
         onHeightChanged: requestPaint()
         onPaint: {

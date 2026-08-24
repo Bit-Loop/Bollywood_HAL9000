@@ -47,3 +47,22 @@ def test_invalid_transition_is_rejected_without_mutating_state() -> None:
     with pytest.raises(InvalidTransition):
         machine.transition(HalState.SPEAKING)
     assert machine.current is HalState.BOOTING
+
+
+def test_wake_word_can_interrupt_an_idle_open_manual_drawer() -> None:
+    machine = HalStateMachine()
+    machine.transition(HalState.STANDBY)
+    machine.enterManual()
+    machine.transition(HalState.WAKE_DETECTED, "wake while drawer is open")
+    assert machine.current is HalState.WAKE_DETECTED
+
+
+@pytest.mark.parametrize(
+    "target",
+    [HalState.THINKING, HalState.TOOL_RUNNING, HalState.SPEAKING],
+)
+def test_resumed_hermes_activity_can_wake_the_standby_display(target: HalState) -> None:
+    machine = HalStateMachine()
+    machine.transition(HalState.STANDBY)
+    machine.transition(target, "activity from resumed Hermes session")
+    assert machine.current is target

@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 
 from hal9000.paths import AppPaths
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 3
 T = TypeVar("T")
 
 
@@ -23,6 +23,7 @@ class GeneralSettings:
     launch_on_login: bool = False
     start_in_standby: bool = True
     standby_timeout_seconds: int = 45
+    zip_code: str = ""
     window_width: int = 800
     window_height: int = 1000
     window_x: int | None = None
@@ -35,7 +36,10 @@ class HermesSettings:
     executable: str = ""
     mode: str = "local"
     backend_url: str = "http://127.0.0.1:9119"
-    profile: str = ""
+    profile: str = "codex-cloud"
+    provider: str = "openai-codex"
+    model: str = "gpt-5.6-sol"
+    reasoning_effort: str = "medium"
     auto_start: bool = True
     last_session_id: str = ""
 
@@ -62,12 +66,12 @@ class SpeechRecognitionSettings:
 
 @dataclass(slots=True)
 class VoiceSettings:
-    mode: str = "auto"
+    mode: str = "piper"
     output_device: str = ""
     volume: float = 0.82
     speaking_rate: float = 1.0
     auto_benchmark_complete: bool = False
-    selected_engine: str = ""
+    selected_engine: str = "Piper"
     last_fallback_reason: str = ""
     benchmark_results: dict[str, Any] = field(default_factory=dict)
 
@@ -97,11 +101,23 @@ class AppConfig:
         self.general.window_width = max(600, self.general.window_width)
         self.general.window_height = max(800, self.general.window_height)
         self.general.standby_timeout_seconds = max(0, self.general.standby_timeout_seconds)
+        postal = (self.general.zip_code or "").replace("\r", "\n").split("\n", 1)[0]
+        postal = " ".join(postal.strip().upper().split())
+        self.general.zip_code = "".join(
+            character for character in postal if character.isalnum() or character in " -"
+        )[:16]
         self.wake.phrase = (self.wake.phrase or "hey hal").strip().lower()
         if self.hermes.mode not in {"local", "remote"}:
             self.hermes.mode = "local"
+        self.hermes.provider = (self.hermes.provider or "").strip()
+        self.hermes.model = (self.hermes.model or "").strip()
+        self.hermes.reasoning_effort = (self.hermes.reasoning_effort or "medium").strip().lower()
+        if self.hermes.reasoning_effort not in {
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+        }:
+            self.hermes.reasoning_effort = "medium"
         if self.voice.mode not in {"auto", "xtts", "piper"}:
-            self.voice.mode = "auto"
+            self.voice.mode = "piper"
         self.wake.sensitivity = min(1.0, max(0.0, float(self.wake.sensitivity)))
         self.voice.volume = min(1.0, max(0.0, float(self.voice.volume)))
         self.voice.speaking_rate = min(2.0, max(0.5, float(self.voice.speaking_rate)))
@@ -141,8 +157,9 @@ class ConfigStore:
             return config
         if not isinstance(raw, dict):
             raw = {}
+        source_version = int(raw.get("version") or CONFIG_VERSION)
         config = AppConfig(
-            version=int(raw.get("version") or CONFIG_VERSION),
+            version=source_version,
             general=_dataclass_from_dict(GeneralSettings, raw.get("general")),
             hermes=_dataclass_from_dict(HermesSettings, raw.get("hermes")),
             wake=_dataclass_from_dict(WakeSettings, raw.get("wake")),
@@ -150,6 +167,19 @@ class ConfigStore:
             voice=_dataclass_from_dict(VoiceSettings, raw.get("voice")),
             appearance=_dataclass_from_dict(AppearanceSettings, raw.get("appearance")),
         )
+        if source_version < 3:
+            if (
+                config.hermes.provider == "openai-codex"
+                and config.hermes.model in {"", "gpt-5.6-terra"}
+            ):
+                config.hermes.profile = "codex-cloud"
+                config.hermes.model = "gpt-5.6-sol"
+            if (
+                config.voice.mode == "auto"
+                and config.voice.selected_engine in {"", "XTTS"}
+            ):
+                config.voice.mode = "piper"
+                config.voice.selected_engine = "Piper"
         config.normalize()
         return config
 

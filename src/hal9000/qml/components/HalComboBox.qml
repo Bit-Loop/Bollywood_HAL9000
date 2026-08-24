@@ -8,6 +8,16 @@ ComboBox {
     leftPadding: 10
     rightPadding: 30
 
+    function labelFor(modelData) {
+        if (typeof modelData === "object" && modelData !== null) {
+            if (control.textRole && modelData[control.textRole] !== undefined)
+                return String(modelData[control.textRole])
+            if (modelData.name !== undefined)
+                return String(modelData.name)
+        }
+        return String(modelData)
+    }
+
     contentItem: Text {
         text: control.displayText
         color: HalTheme.text
@@ -47,8 +57,7 @@ ComboBox {
         width: control.width
         height: 34
         contentItem: Text {
-            text: typeof modelData === "object" && modelData.name !== undefined
-                  ? modelData.name : String(modelData)
+            text: control.labelFor(modelData)
             color: HalTheme.text
             font.family: HalTheme.controlFont
             font.pixelSize: 10
