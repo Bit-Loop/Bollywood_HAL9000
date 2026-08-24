@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, Qt, QUrl
-from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlApplicationEngine, QQmlEngine, QQmlExpression
+from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
 
 from hal9000.config import AppConfig, ConfigStore
@@ -176,5 +178,76 @@ def test_hal_and_9000_are_centered_in_their_own_nameplate_fields(qtbot, tmp_path
 
         assert abs(hal_center - blue_center) <= 1.5
         assert abs(model_center - black_center) <= 1.5
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_transcript_text_can_be_selected_copied_and_pasted(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    sample = "Copy this HAL transcript into the manual prompt."
+    try:
+        controller.openManual()
+        qtbot.waitUntil(lambda: controller.manualOpen, timeout=700)
+        qtbot.wait(600)
+        controller.conversations.append(
+            {
+                "role": "assistant",
+                "text": sample,
+                "streaming": False,
+                "error": False,
+                "timestamp": "12:00",
+            }
+        )
+
+        def visual_descendants(item):
+            for child in item.childItems():
+                yield child
+                yield from visual_descendants(child)
+
+        def transcript_message():
+            transcript_view = next(
+                child
+                for child in window.findChildren(QQuickItem)
+                if child.metaObject().className() == "QQuickListView"
+                and child.property("count") == 1
+                and child.property("width") > 0
+            )
+            return next(
+                (
+                    child
+                    for child in visual_descendants(transcript_view)
+                    if child.property("text") == sample
+                    and child.property("selectByMouse") is not None
+                ),
+                None,
+            )
+
+        qtbot.waitUntil(lambda: transcript_message() is not None, timeout=1000)
+        message = transcript_message()
+        assert message is not None
+        assert message.property("selectByMouse") is True
+
+        context = QQmlEngine.contextForObject(message)
+        select_all = QQmlExpression(context, message, "selectAll()")
+        select_all.evaluate()
+        assert not select_all.hasError(), select_all.error().toString()
+        assert message.property("selectedText") == sample
+
+        clipboard = QGuiApplication.clipboard()
+        clipboard.clear()
+        focus_message = QQmlExpression(context, message, "forceActiveFocus()")
+        focus_message.evaluate()
+        assert not focus_message.hasError(), focus_message.error().toString()
+        QTest.keyClick(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        qtbot.waitUntil(lambda: clipboard.text() == sample, timeout=700)
+
+        prompt = window.findChild(QObject, "manualPrompt")
+        assert prompt is not None
+        prompt_context = QQmlEngine.contextForObject(prompt)
+        focus_prompt = QQmlExpression(prompt_context, prompt, "forceActiveFocus()")
+        focus_prompt.evaluate()
+        assert not focus_prompt.hasError(), focus_prompt.error().toString()
+        QTest.keyClick(window, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        qtbot.waitUntil(lambda: prompt.property("text") == sample, timeout=700)
     finally:
         close_ui(qtbot, controller, engine, window)

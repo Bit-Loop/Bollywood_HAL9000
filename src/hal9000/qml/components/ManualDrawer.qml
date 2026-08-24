@@ -91,7 +91,7 @@ Rectangle {
                     font.letterSpacing: 1
                 }
 
-                Text {
+                TextEdit {
                     id: messageText
                     anchors {
                         left: parent.left
@@ -105,9 +105,15 @@ Rectangle {
                     color: parent.error ? "#c87173" : HalTheme.text
                     font.family: HalTheme.displayFont
                     font.pixelSize: Math.max(12, Math.min(16, transcript.width * 0.026))
-                    lineHeight: 1.22
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
+                    wrapMode: TextEdit.Wrap
+                    textFormat: TextEdit.PlainText
+                    readOnly: true
+                    selectByMouse: true
+                    selectByKeyboard: true
+                    persistentSelection: true
+                    cursorVisible: false
+                    selectionColor: HalTheme.redDeep
+                    selectedTextColor: HalTheme.text
                 }
             }
         }
