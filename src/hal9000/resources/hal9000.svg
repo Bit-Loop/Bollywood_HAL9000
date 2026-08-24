@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="metal" cx="38%" cy="32%" r="68%">
+      <stop offset="0" stop-color="#a7aaa5"/>
+      <stop offset=".38" stop-color="#505350"/>
+      <stop offset=".72" stop-color="#171818"/>
+      <stop offset="1" stop-color="#737570"/>
+    </radialGradient>
+    <radialGradient id="lens" cx="44%" cy="39%" r="60%">
+      <stop offset="0" stop-color="#fff5dc"/>
+      <stop offset=".08" stop-color="#ff5939"/>
+      <stop offset=".3" stop-color="#d4080e"/>
+      <stop offset=".7" stop-color="#650004"/>
+      <stop offset="1" stop-color="#140002"/>
+    </radialGradient>
+  </defs>
+  <rect width="256" height="256" rx="22" fill="#111212"/>
+  <circle cx="128" cy="128" r="94" fill="url(#metal)" stroke="#b7b9b2" stroke-width="5"/>
+  <circle cx="128" cy="128" r="72" fill="#090909" stroke="#353734" stroke-width="8"/>
+  <circle cx="128" cy="128" r="55" fill="url(#lens)" stroke="#6d0709" stroke-width="4"/>
+  <circle cx="128" cy="128" r="20" fill="#f4e9d2"/>
+  <ellipse cx="111" cy="104" rx="15" ry="6" fill="#fff" opacity=".38" transform="rotate(-28 111 104)"/>
+</svg>

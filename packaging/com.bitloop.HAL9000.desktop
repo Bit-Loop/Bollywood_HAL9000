@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HAL 9000
+GenericName=Hermes Voice Companion
+Comment=Native HAL 9000 console and voice frontend for Hermes Agent
+Exec=hal9000
+Icon=com.bitloop.HAL9000
+Terminal=false
+Categories=Utility;
+Keywords=Hermes;assistant;voice;HAL;
+StartupNotify=true
