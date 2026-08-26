@@ -247,6 +247,349 @@ def test_cancel_discards_prompt_waiting_for_session_preferences(qtbot, tmp_path)
     qtbot.wait(20)
 
 
+def test_failed_self_mcp_probe_stays_degraded_and_does_not_block_chat_session(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service.client._state = "connected"
+    service._self_mcp_enabled = True
+    service._self_mcp_stage = "testing"
+    service._self_mcp_request = "probe-1"
+    requests: list[tuple[str, dict]] = []
+
+    def request(method: str, params: dict | None = None, timeout_ms: int = 120_000, **kwargs) -> str:
+        requests.append((method, params or kwargs.get("params") or {}))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service._on_rpc_result(
+        "probe-1",
+        "mcp.servers.test",
+        {"ok": False, "error": "Connection closed", "tools": []},
+    )
+
+    assert service.selfMcpStatus in {"degraded", "retrying"}
+    assert service._self_mcp_stage != "ready"
+    assert any(method in {"session.create", "session.resume"} for method, _ in requests)
+    assert service._self_mcp_retry_timer.isActive()
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_repeated_self_mcp_failures_do_not_create_duplicate_sessions(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")), tmp_path
+    )
+    service.client._state = "connected"
+    service._self_mcp_enabled = True
+    requests: list[tuple[str, dict]] = []
+    service.client.request = lambda method, params, *args, **kwargs: (
+        requests.append((method, params)) or f"request-{len(requests)}"
+    )
+
+    service._self_mcp_failed("first failure")
+    service._self_mcp_failed("second failure")
+
+    session_requests = [
+        method for method, _params in requests if method in {"session.create", "session.resume"}
+    ]
+    assert session_requests == ["session.create"]
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_late_self_mcp_is_ready_only_after_active_session_reload(qtbot, tmp_path) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service.client._state = "connected"
+    service._runtime_session_id = "runtime-session"
+    service._self_mcp_enabled = True
+    service._self_mcp_stage = "testing"
+    service._self_mcp_request = "probe"
+    requests: list[tuple[str, dict]] = []
+    service.client.request = lambda method, params, *args, **kwargs: (
+        requests.append((method, params)) or "reload"
+    )
+
+    service._on_rpc_result("probe", "mcp.servers.test", {"ok": True})
+
+    assert service.selfMcpStatus == "reloading"
+    assert requests[-1][0] == "reload.mcp"
+    assert requests[-1][1]["confirm"] is True
+    service._on_rpc_result("reload", "reload.mcp", {"status": "ok"})
+    assert service.selfMcpStatus == "ready"
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_task_route_selected_before_session_is_applied_when_session_connects(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+
+    def request(method: str, params: dict | None = None, timeout_ms: int = 120_000, **kwargs) -> str:
+        requests.append((method, params or kwargs.get("params") or {}))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service.ensureRoute("openai-codex", "gpt-5.6-sol", "medium")
+    service._on_rpc_result(
+        "session-create",
+        "session.create",
+        {"session_id": "runtime", "info": {"tools": {}}},
+    )
+
+    method, params = requests[-1]
+    assert method == "config.set"
+    assert params["key"] == "model"
+    assert "gpt-5.6-sol" in params["value"]
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_reconnected_transport_resumes_existing_runtime_session(qtbot, tmp_path) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")),
+        tmp_path,
+    )
+    service._runtime_session_id = "runtime-session"
+    service._stored_session_id = "stored-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+    service.client.request = lambda method, params, *args, **kwargs: (
+        requests.append((method, params)) or "request"
+    )
+
+    service._on_connection("connected")
+
+    assert requests[0] == (
+        "session.resume",
+        {"session_id": "stored-session", "profile": "codex-cloud"},
+    )
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_unstable_connection_does_not_reset_backend_restart_budget(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")), tmp_path
+    )
+    service.client.request = lambda *args, **kwargs: "session-request"
+    service._restart_attempts = 3
+    service._backend_failures.extend((1.0, 2.0, 3.0))
+
+    service._on_connection("connected")
+    assert service._restart_stability_timer.isActive()
+    service._on_connection("reconnecting")
+
+    assert not service._restart_stability_timer.isActive()
+    assert service._restart_attempts == 3
+    assert list(service._backend_failures) == [1.0, 2.0, 3.0]
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_automatic_route_reasoning_does_not_mutate_sticky_manual_default(
+    qtbot, tmp_path
+) -> None:
+    settings = HermesSettings(executable=str(tmp_path / "missing-hermes"))
+    service = HermesService(settings, tmp_path)
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+
+    def request(method: str, params: dict, timeout_ms: int = 120_000) -> str:
+        requests.append((method, params))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service.ensureRoute("openai-codex", "gpt-5.6-sol", "high")
+    service._on_rpc_result("request-1", "config.set", {"output": "model applied"})
+    service._on_rpc_result("request-2", "config.set", {"output": "reasoning applied"})
+
+    assert settings.model == "gpt-5.6-terra"
+    assert settings.reasoning_effort == "medium"
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_failed_automatic_route_hands_queued_prompt_back_to_hermes_fallback(
+    qtbot, tmp_path
+) -> None:
+    settings = HermesSettings(executable=str(tmp_path / "missing-hermes"))
+    service = HermesService(settings, tmp_path)
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+
+    def request(method: str, params: dict, timeout_ms: int = 120_000) -> str:
+        requests.append((method, params))
+        return f"request-{len(requests)}"
+
+    service.client.request = request
+    service.ensureRoute("openai-codex", "gpt-5.6-sol", "medium")
+    service.sendPrompt("Continue through Hermes fallback")
+    service._on_rpc_error("request-1", "config.set", "route unavailable", 5001)
+
+    assert any(
+        method == "prompt.submit"
+        and params["text"] == "Continue through Hermes fallback"
+        for method, params in requests
+    )
+    assert settings.model == "gpt-5.6-terra"
+
+    service.ensureRoute("openai-codex", "gpt-5.6-sol", "medium")
+    assert [method for method, _params in requests].count("config.set") == 2
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_offline_local_route_failure_does_not_escape_to_hermes_fallback(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")), tmp_path
+    )
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+    errors: list[str] = []
+    service.client.request = lambda method, params, *args, **kwargs: (
+        requests.append((method, params)) or f"request-{len(requests)}"
+    )
+    service.errorOccurred.connect(errors.append)
+
+    service.ensureRoute(
+        "ollama",
+        "qwen-local",
+        "medium",
+        allow_hermes_fallback=False,
+    )
+    service.sendPrompt("Remain offline")
+    service._on_rpc_error("request-1", "config.set", "local model vanished", 5001)
+
+    assert not any(method == "prompt.submit" for method, _params in requests)
+    assert any("did not send" in message for message in errors)
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_offline_local_reasoning_failure_does_not_release_queued_prompt(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")), tmp_path
+    )
+    service._runtime_session_id = "runtime-session"
+    service.client._state = "connected"
+    requests: list[tuple[str, dict]] = []
+    service.client.request = lambda method, params, *args, **kwargs: (
+        requests.append((method, params)) or f"request-{len(requests)}"
+    )
+
+    service.ensureRoute(
+        "ollama",
+        "qwen-local",
+        "medium",
+        allow_hermes_fallback=False,
+    )
+    service.sendPrompt("Remain offline after reasoning setup")
+    service._on_rpc_result("request-1", "config.set", {"output": "model applied"})
+    service._on_rpc_result(
+        "request-2", "config.set", {"warning": "reasoning failed locally"}
+    )
+
+    assert not any(method == "prompt.submit" for method, _params in requests)
+    assert service._preference_state == "failed"
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_session_info_reports_observed_model_and_reload_failure_is_not_ready(
+    qtbot, tmp_path
+) -> None:
+    service = HermesService(
+        HermesSettings(executable=str(tmp_path / "missing-hermes")), tmp_path
+    )
+    observed: list[tuple[str, str]] = []
+    observed_reasoning: list[str] = []
+    service.activeModelChanged.connect(
+        lambda provider, model: observed.append((provider, model))
+    )
+    service.activeReasoningChanged.connect(observed_reasoning.append)
+
+    service._on_event(
+        {
+            "type": "session.info",
+            "session_id": "",
+            "payload": {
+                "provider": "ollama",
+                "model": "qwen-local",
+                "reasoning": "low",
+            },
+        }
+    )
+    assert observed == [("ollama", "qwen-local")]
+    assert observed_reasoning == ["low"]
+
+    service.client._state = "connected"
+    service._self_mcp_enabled = True
+    service._self_mcp_reload_request = "reload-1"
+    service._on_rpc_result(
+        "reload-1", "reload.mcp", {"ok": False, "error": "connection closed"}
+    )
+    assert service.selfMcpStatus == "degraded"
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
+def test_disabling_automatic_recovery_disables_mcp_and_backend_retry_timers(
+    qtbot, tmp_path
+) -> None:
+    settings = HermesSettings(executable=str(tmp_path / "missing-hermes"))
+    settings.router.auto_recovery = False
+    service = HermesService(settings, tmp_path)
+    service.client._state = "connected"
+    service._self_mcp_enabled = True
+    service._want_running = True
+    service.client.request = lambda *args, **kwargs: "request"
+
+    service._self_mcp_failed("probe failed")
+    service._on_process_running(False)
+
+    assert not service._self_mcp_retry_timer.isActive()
+    assert not service._restart_timer.isActive()
+    assert service.status == "error"
+    service.close()
+    service.deleteLater()
+    qtbot.wait(20)
+
+
 def test_only_latest_model_workflow_can_release_a_queued_prompt(qtbot, tmp_path) -> None:
     service = HermesService(
         HermesSettings(executable=str(tmp_path / "missing-hermes")),

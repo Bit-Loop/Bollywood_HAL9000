@@ -7,20 +7,22 @@ ApplicationWindow {
     id: window
     visible: false
     title: "HAL 9000"
-    width: controller.settingsSnapshot.general.window_width || 800
-    height: controller.settingsSnapshot.general.window_height || 1000
+    width: 800
+    height: 1000
     minimumWidth: 600
     minimumHeight: 800
     color: HalTheme.black
 
     readonly property bool portrait: height >= width * 1.08
-    readonly property real uiScale: controller.settingsSnapshot.appearance.ui_scale || 1.0
-    readonly property real animationAmount: controller.settingsSnapshot.appearance.animation_amount ?? 0.72
-    readonly property real eyeBrightness: controller.settingsSnapshot.appearance.eye_brightness || 0.9
-    readonly property bool speakerVisualization: controller.settingsSnapshot.appearance.speaker_visualization ?? true
+    readonly property real uiScale: controller.uiScale
+    readonly property real animationAmount: controller.animationAmount
+    readonly property real eyeBrightness: controller.eyeBrightness
+    readonly property bool speakerVisualization: controller.speakerVisualization
     readonly property real chassisMargin: Math.max(6, Math.min(width, height) * 0.014)
 
     Component.onCompleted: {
+        width = controller.settingsSnapshot.general.window_width || 800
+        height = controller.settingsSnapshot.general.window_height || 1000
         controller.startup()
     }
 

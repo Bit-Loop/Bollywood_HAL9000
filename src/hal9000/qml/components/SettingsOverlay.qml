@@ -5,9 +5,11 @@ import "."
 
 Rectangle {
     id: root
+    objectName: "settingsOverlay"
     property var snapshot: ({})
     property var diagnostics: ({})
     property var integrations: []
+    readonly property bool compact: width < 760
     signal closeRequested()
 
     function benchmarkSummary() {
@@ -78,49 +80,61 @@ Rectangle {
         }
     }
 
-    RowLayout {
+    GridLayout {
         anchors { left: parent.left; right: parent.right; top: parent.top; bottom: parent.bottom; topMargin: 64 }
-        spacing: 0
+        columns: root.compact ? 1 : 2
+        rowSpacing: 0
+        columnSpacing: 0
 
         Rectangle {
-            Layout.preferredWidth: Math.min(158, root.width * 0.23)
-            Layout.fillHeight: true
+            Layout.preferredWidth: root.compact ? root.width : Math.min(158, root.width * 0.23)
+            Layout.preferredHeight: root.compact ? 54 : -1
+            Layout.fillWidth: root.compact
+            Layout.fillHeight: !root.compact
             color: "#101111"
             border.width: 1
             border.color: HalTheme.line
 
             ButtonGroup { id: settingsTabs }
-            Column {
-                anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+            ListView {
+                id: settingsNavigation
+                objectName: "settingsNavigation"
+                readonly property bool horizontalNavigation: root.compact
+                anchors.fill: parent
+                anchors.margins: root.compact ? 5 : 10
                 spacing: 4
-                Repeater {
-                    model: ["GENERAL", "HERMES", "WAKE", "SPEECH", "VOICE", "APPEARANCE", "SAFETY", "DIAGNOSTICS"]
-                    delegate: Button {
-                        required property string modelData
-                        required property int index
-                        width: parent.width
-                        height: 39
-                        text: modelData
-                        checkable: true
-                        checked: index === pages.currentIndex
-                        ButtonGroup.group: settingsTabs
-                        onClicked: pages.currentIndex = index
-                        contentItem: Text {
-                            text: parent.text
-                            color: parent.checked ? HalTheme.text : HalTheme.dim
-                            font.family: HalTheme.controlFont
-                            font.pixelSize: 9
-                            font.weight: parent.checked ? Font.Bold : Font.Normal
-                            font.letterSpacing: 0.8
-                            verticalAlignment: Text.AlignVCenter
-                            leftPadding: 10
-                        }
-                        background: Rectangle {
-                            color: parent.checked ? "#232423" : parent.hovered ? "#171818" : "transparent"
-                            border.width: parent.checked ? 1 : 0
-                            border.color: HalTheme.steelDark
-                            radius: HalTheme.radiusSmall
-                        }
+                orientation: root.compact ? ListView.Horizontal : ListView.Vertical
+                clip: true
+                model: ["GENERAL", "HERMES", "WAKE", "SPEECH", "VOICE", "APPEARANCE", "SAFETY", "DIAGNOSTICS"]
+                ScrollBar.horizontal: ScrollBar {
+                    policy: root.compact ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                }
+                delegate: Button {
+                    required property string modelData
+                    required property int index
+                    width: root.compact ? 112 : settingsNavigation.width
+                    height: 39
+                    text: modelData
+                    checkable: true
+                    checked: index === pages.currentIndex
+                    ButtonGroup.group: settingsTabs
+                    onClicked: pages.currentIndex = index
+                    contentItem: Text {
+                        text: parent.text
+                        color: parent.checked ? HalTheme.text : HalTheme.dim
+                        font.family: HalTheme.controlFont
+                        font.pixelSize: 9
+                        font.weight: parent.checked ? Font.Bold : Font.Normal
+                        font.letterSpacing: 0.8
+                        verticalAlignment: Text.AlignVCenter
+                        horizontalAlignment: root.compact ? Text.AlignHCenter : Text.AlignLeft
+                        leftPadding: root.compact ? 0 : 10
+                    }
+                    background: Rectangle {
+                        color: parent.checked ? "#232423" : parent.hovered ? "#171818" : "transparent"
+                        border.width: parent.checked ? 1 : 0
+                        border.color: HalTheme.steelDark
+                        radius: HalTheme.radiusSmall
                     }
                 }
             }
@@ -167,6 +181,17 @@ Rectangle {
                     }
                 }
                 SettingRow {
+                    label: "Your name"
+                    detail: "HAL uses this preferred name as user-provided context, never as identity or authorization."
+                    HalTextField {
+                        anchors.fill: parent
+                        text: root.snapshot.operator ? root.snapshot.operator.preferred_name : ""
+                        placeholderText: "Isaiah"
+                        maximumLength: 80
+                        onEditingFinished: controller.updateSetting("operator.preferred_name", text)
+                    }
+                }
+                SettingRow {
                     label: "Launch on login"
                     HalCheckBox {
                         anchors.centerIn: parent
@@ -210,7 +235,7 @@ Rectangle {
                 }
                 SettingRow {
                     label: "Chat model"
-                    detail: "Pulled from authenticated Hermes providers. The choice applies only to this HAL session."
+                    detail: "Automatic uses Terra medium normally and Sol medium for coding or consequential work. Other choices are sticky manual overrides."
                     RowLayout {
                         anchors.fill: parent
                         spacing: 5
@@ -232,6 +257,36 @@ Rectangle {
                     }
                 }
                 SettingRow {
+                    label: "Resource policy"
+                    detail: "Balanced prefers subscription models. Offline local allows only models that fit fresh resource evidence and reserved headroom."
+                    HalComboBox {
+                        anchors.fill: parent
+                        model: ["balanced", "constrained", "offline_local"]
+                        currentIndex: Math.max(0, model.indexOf(root.snapshot.hermes && root.snapshot.hermes.router ? root.snapshot.hermes.router.resource_policy : "balanced"))
+                        onActivated: controller.updateSetting("hermes.router.resource_policy", currentText)
+                    }
+                }
+                SettingRow {
+                    label: "Automatic recovery"
+                    detail: "Reconnects the Hermes backend and independently retries HAL Self MCP with bounded backoff."
+                    HalCheckBox {
+                        anchors.centerIn: parent
+                        checked: root.snapshot.hermes && root.snapshot.hermes.router ? root.snapshot.hermes.router.auto_recovery : true
+                        onToggled: controller.updateSetting("hermes.router.auto_recovery", checked)
+                    }
+                }
+                SettingRow {
+                    label: "HAL Self MCP"
+                    Text {
+                        anchors.fill: parent
+                        text: controller.selfMcpStatus.toUpperCase()
+                        color: controller.selfMcpStatus === "ready" ? HalTheme.text : HalTheme.muted
+                        font.family: HalTheme.controlFont
+                        font.pixelSize: 9
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                SettingRow {
                     label: "Reasoning effort"
                     detail: "Session-scoped. This changes only HAL's selected Hermes model."
                     HalComboBox {
@@ -242,7 +297,7 @@ Rectangle {
                     }
                 }
                 SettingRow {
-                    label: "Active route"
+                    label: "Observed route"
                     Text {
                         anchors.fill: parent
                         text: controller.hermesModelLabel
@@ -352,7 +407,7 @@ Rectangle {
                     label: "Sensitivity"
                     RowLayout {
                         anchors.fill: parent
-                        HalSlider { id: wakeSensitivity; Layout.fillWidth: true; from: 0; to: 1; stepSize: 0.05; value: root.snapshot.wake ? root.snapshot.wake.sensitivity : 0.6; onMoved: controller.updateSetting("wake.sensitivity", value) }
+                        HalSlider { id: wakeSensitivity; Layout.fillWidth: true; from: 0; to: 1; stepSize: 0.05; value: root.snapshot.wake ? root.snapshot.wake.sensitivity : 0.6; onMoved: controller.previewSetting("wake.sensitivity", value); onPressedChanged: if (!pressed) controller.commitSetting("wake.sensitivity") }
                         Text { text: wakeSensitivity.value.toFixed(2); color: HalTheme.text; font.family: HalTheme.controlFont; font.pixelSize: 10 }
                     }
                 }
@@ -440,16 +495,36 @@ Rectangle {
                     }
                 }
                 SettingRow {
+                    label: "Response voice"
+                    detail: "Always speaks every reply; Voice prompts only speaks wake-word or microphone conversations; Text only stays silent."
+                    HalComboBox {
+                        anchors.fill: parent
+                        model: [
+                            {"label": "Always", "value": "always"},
+                            {"label": "Voice prompts only", "value": "voice_prompts"},
+                            {"label": "Text only", "value": "text_only"}
+                        ]
+                        textRole: "label"
+                        currentIndex: {
+                            const wanted = root.snapshot.voice ? root.snapshot.voice.response_mode : "always"
+                            for (let i = 0; i < model.length; ++i)
+                                if (model[i].value === wanted) return i
+                            return 0
+                        }
+                        onActivated: controller.updateSetting("voice.response_mode", model[currentIndex].value)
+                    }
+                }
+                SettingRow {
                     label: "Output device"
                     HalComboBox { anchors.fill: parent; model: audioDevices.outputDevices; textRole: "name"; onActivated: controller.updateSetting("voice.output_device", model[currentIndex].id) }
                 }
                 SettingRow {
                     label: "Volume"
-                    HalSlider { anchors.fill: parent; from: 0; to: 1; stepSize: 0.05; value: root.snapshot.voice ? root.snapshot.voice.volume : 0.82; onMoved: controller.updateSetting("voice.volume", value) }
+                    HalSlider { anchors.fill: parent; from: 0; to: 1; stepSize: 0.05; value: root.snapshot.voice ? root.snapshot.voice.volume : 0.82; onMoved: controller.previewSetting("voice.volume", value); onPressedChanged: if (!pressed) controller.commitSetting("voice.volume") }
                 }
                 SettingRow {
                     label: "Speaking rate"
-                    HalSlider { anchors.fill: parent; from: 0.5; to: 2; stepSize: 0.05; value: root.snapshot.voice ? root.snapshot.voice.speaking_rate : 1; onMoved: controller.updateSetting("voice.speaking_rate", value) }
+                    HalSlider { anchors.fill: parent; from: 0.5; to: 2; stepSize: 0.05; value: root.snapshot.voice ? root.snapshot.voice.speaking_rate : 1; onMoved: controller.previewSetting("voice.speaking_rate", value); onPressedChanged: if (!pressed) controller.commitSetting("voice.speaking_rate") }
                 }
                 SettingRow {
                     label: "Runtime"
@@ -504,9 +579,9 @@ Rectangle {
                 leftMargin: 22; rightMargin: 22
                 SettingSection { title: "Appearance"; detail: "The restrained physical console is the default. Animation values affect only low-cost opacity and transforms." }
                 SettingRow { label: "Fullscreen"; HalCheckBox { anchors.centerIn: parent; checked: controller.fullscreen; onToggled: if (checked !== controller.fullscreen) controller.toggleFullscreen() } }
-                SettingRow { label: "UI scale"; HalSlider { anchors.fill: parent; from: 0.7; to: 1.6; stepSize: 0.05; value: root.snapshot.appearance ? root.snapshot.appearance.ui_scale : 1; onMoved: controller.updateSetting("appearance.ui_scale", value) } }
-                SettingRow { label: "Animation amount"; HalSlider { anchors.fill: parent; from: 0; to: 1; stepSize: 0.05; value: root.snapshot.appearance ? root.snapshot.appearance.animation_amount : 0.72; onMoved: controller.updateSetting("appearance.animation_amount", value) } }
-                SettingRow { label: "Eye brightness"; HalSlider { anchors.fill: parent; from: 0.1; to: 1; stepSize: 0.05; value: root.snapshot.appearance ? root.snapshot.appearance.eye_brightness : 0.9; onMoved: controller.updateSetting("appearance.eye_brightness", value) } }
+                SettingRow { label: "UI scale"; HalSlider { anchors.fill: parent; from: 0.7; to: 1.6; stepSize: 0.05; value: controller.uiScale; onMoved: controller.previewSetting("appearance.ui_scale", value); onPressedChanged: if (!pressed) controller.commitSetting("appearance.ui_scale") } }
+                SettingRow { label: "Animation amount"; HalSlider { anchors.fill: parent; from: 0; to: 1; stepSize: 0.05; value: controller.animationAmount; onMoved: controller.previewSetting("appearance.animation_amount", value); onPressedChanged: if (!pressed) controller.commitSetting("appearance.animation_amount") } }
+                SettingRow { label: "Eye brightness"; HalSlider { anchors.fill: parent; from: 0.1; to: 1; stepSize: 0.05; value: controller.eyeBrightness; onMoved: controller.previewSetting("appearance.eye_brightness", value); onPressedChanged: if (!pressed) controller.commitSetting("appearance.eye_brightness") } }
                 SettingRow { label: "Speaker visualization"; HalCheckBox { anchors.centerIn: parent; checked: root.snapshot.appearance ? root.snapshot.appearance.speaker_visualization : true; onToggled: controller.updateSetting("appearance.speaker_visualization", checked) } }
             }
 
@@ -541,6 +616,8 @@ Rectangle {
                 leftMargin: 22; rightMargin: 22
                 SettingSection { title: "Diagnostics"; detail: "Fresh read-only checks of the current runtime and optional subsystems." }
                 SettingRow { label: "Hermes"; Text { anchors.fill: parent; text: controller.hermesStatus + " / " + controller.backendLatency.toFixed(0) + " ms"; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
+                SettingRow { label: "HAL Self MCP"; Text { anchors.fill: parent; text: controller.selfMcpStatus.toUpperCase(); color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
+                SettingRow { label: "Subscription quota"; Text { anchors.fill: parent; text: controller.subscriptionUsageLabel; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 9; verticalAlignment: Text.AlignVCenter; wrapMode: Text.Wrap } }
                 SettingRow { label: "Wake detector"; Text { anchors.fill: parent; text: controller.wakeStatus; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
                 SettingRow { label: "Microphone"; Text { anchors.fill: parent; text: controller.microphoneStatus; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }
                 SettingRow { label: "STT"; Text { anchors.fill: parent; text: controller.sttStatus + " / " + controller.sttBackend; color: HalTheme.muted; font.family: HalTheme.controlFont; font.pixelSize: 10; verticalAlignment: Text.AlignVCenter } }

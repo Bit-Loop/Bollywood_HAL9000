@@ -6,15 +6,18 @@ Item {
     id: root
     property string label: ""
     property string detail: ""
+    readonly property bool compact: width < 680
     default property alias controlData: controlHost.data
     width: parent ? parent.width : 600
     // A deterministic row height avoids a loop between the anchored control host,
     // the row layout, and childrenRect during hidden StackLayout page creation.
-    implicitHeight: detail.length > 0 ? 72 : 56
+    implicitHeight: compact ? (detail.length > 0 ? 116 : 94) : (detail.length > 0 ? 72 : 56)
 
-    RowLayout {
+    GridLayout {
         anchors.fill: parent
-        spacing: HalTheme.spacing4
+        columns: root.compact ? 1 : 2
+        rowSpacing: HalTheme.spacing2
+        columnSpacing: HalTheme.spacing4
 
         Column {
             id: labels
@@ -43,8 +46,9 @@ Item {
 
         Item {
             id: controlHost
-            Layout.preferredWidth: Math.min(330, root.width * 0.48)
-            Layout.fillHeight: true
+            Layout.preferredWidth: root.compact ? root.width : Math.min(330, root.width * 0.48)
+            Layout.fillWidth: root.compact
+            Layout.preferredHeight: root.compact ? 44 : root.height
             Layout.alignment: Qt.AlignVCenter
         }
     }

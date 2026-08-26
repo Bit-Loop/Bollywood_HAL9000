@@ -193,7 +193,11 @@ class MachineSelfService:
         resource_sampler = HostResourceSampler(self.paths.sentience_root)
         retention = RetentionPolicyEngine(database, blobs, self.settings.storage)
         diagnostics = MachineSelfDiagnostics(database, self.settings, blobs, degradation)
-        context_compiler = ContextCompiler(database, self.settings)
+        context_compiler = ContextCompiler(
+            database,
+            self.settings,
+            operator_preferred_name=self.config.operator.preferred_name,
+        )
         mapper = HermesEventMapper(
             database,
             boot_id,
@@ -739,6 +743,12 @@ class MachineSelfService:
     def expect_model_selection(self, provider: str, model: str) -> None:
         if self.mapper:
             self.mapper.expect_model_selection(provider, model)
+
+    def update_operator_preferred_name(self, preferred_name: str) -> None:
+        """Refresh non-authoritative operator context without restarting HAL."""
+
+        if self.context_compiler is not None:
+            self.context_compiler.operator_preferred_name = preferred_name.strip()
 
     def resolve_approval(self, request_id: str, choice: str) -> Future | None:
         if not self.mapper:

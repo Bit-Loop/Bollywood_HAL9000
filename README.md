@@ -20,10 +20,12 @@ double-click reopening it.
 - Hermes `serve` JSON-RPC over WebSocket, including durable session resume,
   streaming text, actual tool events, cancellation, approvals, health probing,
   reconnect/backoff, and owned-process shutdown.
-- Session-scoped Hermes model selection from its authenticated provider list.
-  HAL uses the isolated `codex-cloud` profile with the ChatGPT-subscription
-  `openai-codex/gpt-5.6-sol` route at medium reasoning, without changing other
-  Hermes sessions or global config and without Hybrid-MoA's local advisors.
+- Session-scoped model selection from Hermes' authenticated provider list.
+  Automatic routing uses ChatGPT-subscription `gpt-5.6-terra` at medium effort
+  for ordinary conversation and `gpt-5.6-sol` at medium effort for coding or
+  consequential tasks. Manual choices remain sticky; explicit offline-local
+  routing requires fresh availability and memory-headroom evidence. Hermes
+  still owns sessions, provider fallback, approvals, and the agent loop.
 - One 16 kHz microphone stream shared by Sherpa open-vocabulary wake detection,
   VAD capture, and push-to-talk. Raw microphone audio is not persisted.
 - Faster-Whisper `small`/English, with CUDA inference attempted first and a
@@ -36,6 +38,10 @@ double-click reopening it.
 - Atomic versioned XDG configuration, desktop-keyring storage for an optional
   remote Hermes token, managed model caches, rotating logs, and reversible XDG
   autostart.
+- Responsive settings include a preferred user name, coarse postal location,
+  Always / Voice prompts only / Text only speech behavior, bounded backend and
+  HAL Self MCP recovery, and a readable two-line model inventory. Subscription
+  quota is shown as unknown when Hermes does not expose a supported signal.
 - A persistent four-plane machine self: transactional identity/capability/task
   authority, bounded DataSketches interoception, compact causal memory, selected
   content-addressed forensic evidence, and a token-bounded context compiler.

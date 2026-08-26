@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,12 @@ from hal9000.clicks import SpeakerClickAggregator
 from hal9000.config import AppConfig, ConfigStore
 from hal9000.diagnostics import DiagnosticsRunner
 from hal9000.hermes.service import HermesService
+from hal9000.hermes.router import (
+    ModelOption,
+    ResourceSnapshot,
+    RouteDecision,
+    TaskAwareModelRouter,
+)
 from hal9000.location import prompt_with_location
 from hal9000.models import ActivityModel, ApprovalModel, ConversationModel
 from hal9000.paths import AppPaths
@@ -44,6 +51,8 @@ class HalController(QObject):
     subsystemChanged = Signal()
     integrationsChanged = Signal()
     configChanged = Signal()
+    appearanceChanged = Signal()
+    voiceSettingsChanged = Signal()
     firstRunChanged = Signal(bool)
     diagnosticsChanged = Signal()
     focusInputRequested = Signal()
@@ -84,6 +93,7 @@ class HalController(QObject):
         self.secret_store = SecretStore()
         self._hermes_token = self.secret_store.get_hermes_token()
         self.hermes = HermesService(config.hermes, cwd, self._hermes_token, self)
+        self.model_router = TaskAwareModelRouter(config.hermes.router)
         self.machine_self = MachineSelfService(paths, config, cwd)
         if config.sentience.enabled:
             self.hermes.enableSelfMcp()
@@ -144,8 +154,12 @@ class HalController(QObject):
         self._model_progress = 0.0
         self._recent_errors: list[str] = []
         self._hermes_models: list[dict[str, Any]] = []
-        self._hermes_model_provider = config.hermes.provider
-        self._hermes_model_name = config.hermes.model
+        # These fields describe the route Hermes has actually reported or
+        # accepted, never merely the route HAL requested.
+        self._hermes_model_provider = ""
+        self._hermes_model_name = ""
+        self._hermes_reasoning_effort = ""
+        self._last_route_decision: RouteDecision | None = None
         self._cuda_status = "not probed"
         self._manual_idle_timer = QTimer(self)
         self._manual_idle_timer.setSingleShot(True)
@@ -153,6 +167,11 @@ class HalController(QObject):
         self._machine_outbox_timer = QTimer(self)
         self._machine_outbox_timer.setInterval(250)
         self._machine_outbox_timer.timeout.connect(self._dispatch_machine_outbox)
+        self._setting_commit_timer = QTimer(self)
+        self._setting_commit_timer.setSingleShot(True)
+        self._setting_commit_timer.setInterval(250)
+        self._setting_commit_timer.timeout.connect(self._commit_preview_settings)
+        self._pending_preview_settings: set[str] = set()
         self._scheduled_timers: set[QTimer] = set()
         self._cudaDetected.connect(self._set_cuda_status)
         self._machinePromptResult.connect(self._machine_prompt_result)
@@ -167,8 +186,13 @@ class HalController(QObject):
         self.hermes.integrationsChanged.connect(self._set_integrations)
         self.hermes.modelOptionsReady.connect(self._set_hermes_model_options)
         self.hermes.modelChanged.connect(self._hermes_model_changed)
+        self.hermes.activeModelChanged.connect(self._hermes_active_model_changed)
         self.hermes.reasoningChanged.connect(self._hermes_reasoning_changed)
+        self.hermes.activeReasoningChanged.connect(self._hermes_active_reasoning_changed)
         self.hermes.modelOperationError.connect(self._model_operation_error)
+        self.hermes.selfMcpStatusChanged.connect(lambda _value: self.subsystemChanged.emit())
+        self.hermes.selfMcpDegraded.connect(self._self_mcp_degraded)
+        self.hermes.routeHealthChanged.connect(lambda _value: self.subsystemChanged.emit())
         self.hermes.sessionChanged.connect(self._hermes_session_changed)
         self.hermes.assistantStarted.connect(self._assistant_started)
         self.hermes.assistantDelta.connect(self._assistant_delta)
@@ -302,6 +326,34 @@ class HalController(QObject):
     def cudaStatus(self) -> str:
         return self._cuda_status
 
+    @Property(str, notify=subsystemChanged)
+    def selfMcpStatus(self) -> str:
+        return self.hermes.selfMcpStatus
+
+    @Property("QVariantMap", notify=subsystemChanged)
+    def routeHealth(self) -> dict[str, Any]:
+        return self.hermes.routeHealth
+
+    @Property(str, notify=subsystemChanged)
+    def subscriptionUsageLabel(self) -> str:
+        return "Unknown — not exposed by Hermes Gateway"
+
+    @Property(float, notify=appearanceChanged)
+    def uiScale(self) -> float:
+        return self.config.appearance.ui_scale
+
+    @Property(float, notify=appearanceChanged)
+    def animationAmount(self) -> float:
+        return self.config.appearance.animation_amount
+
+    @Property(float, notify=appearanceChanged)
+    def eyeBrightness(self) -> float:
+        return self.config.appearance.eye_brightness
+
+    @Property(bool, notify=appearanceChanged)
+    def speakerVisualization(self) -> bool:
+        return self.config.appearance.speaker_visualization
+
     @Property("QVariantMap", notify=configChanged)
     def settingsSnapshot(self) -> dict[str, Any]:
         return asdict(self.config)
@@ -336,6 +388,8 @@ class HalController(QObject):
 
     @Property(int, notify=hermesModelsChanged)
     def hermesModelIndex(self) -> int:
+        if self.config.hermes.router.enabled:
+            return 0 if self._hermes_models else -1
         for index, item in enumerate(self._hermes_models):
             if (
                 item.get("provider") == self._hermes_model_provider
@@ -348,12 +402,17 @@ class HalController(QObject):
     def hermesModelLabel(self) -> str:
         if not self._hermes_model_name:
             return "WAITING FOR HERMES"
-        return (
-            f"{self._hermes_model_provider} // {self._hermes_model_name} // "
-            f"{self.config.hermes.reasoning_effort.upper()}"
-            if self._hermes_model_provider
-            else self._hermes_model_name
-        )
+        parts = [
+            part
+            for part in (
+                self._hermes_model_provider,
+                self._hermes_model_name,
+                self._hermes_reasoning_effort.upper(),
+            )
+            if part
+        ]
+        route = " // ".join(parts)
+        return "AUTOMATIC // " + route if self.config.hermes.router.enabled else route
 
     @Slot()
     def startup(self) -> None:
@@ -390,6 +449,7 @@ class HalController(QObject):
             return
         self._shutdown_complete = True
         self._machine_outbox_timer.stop()
+        self._setting_commit_timer.stop()
         for timer in tuple(self._scheduled_timers):
             timer.stop()
             timer.deleteLater()
@@ -473,8 +533,21 @@ class HalController(QObject):
         self._append_message("user", clean)
         self._assistant_row = -1
         self._assistant_text = ""
+        decision = self._route_prompt(clean)
+        if not decision.available:
+            self._record_route_decision(decision)
+            self._append_message("system", decision.reason, error=True)
+            self._transition(HalState.ERROR, "no model route available")
+            return
         self._transition(HalState.THINKING, "prompt submitted")
         outgoing = prompt_with_location(clean, self.config.general.zip_code)
+        if self.config.operator.preferred_name:
+            outgoing = (
+                "<hal_operator_preference source=\"user_configuration\" authority=\"false\">"
+                + self.config.operator.preferred_name
+                + "</hal_operator_preference>\n"
+                + outgoing
+            )
         if self.machine_self.database is None:
             self.hermes.sendPrompt(outgoing)
             return
@@ -485,17 +558,30 @@ class HalController(QObject):
             user_text=clean,
         )
 
-        def completed(result, fallback=outgoing) -> None:
+        def completed(result, fallback=outgoing, selected_route=decision) -> None:
             try:
-                self._machinePromptResult.emit((result.result(), "", fallback))
+                self._machinePromptResult.emit(
+                    (result.result(), "", fallback, selected_route)
+                )
             except Exception as exc:
-                self._machinePromptResult.emit((None, str(exc), fallback))
+                self._machinePromptResult.emit(
+                    (None, str(exc), fallback, selected_route)
+                )
 
         future.add_done_callback(completed)
 
     @Slot(object)
     def _machine_prompt_result(self, payload: object) -> None:
-        prepared, error, fallback = payload if isinstance(payload, tuple) else (None, "invalid result", "")
+        prepared, error, fallback, decision = (
+            payload
+            if isinstance(payload, tuple) and len(payload) == 4
+            else (None, "invalid result", "", None)
+        )
+        if isinstance(decision, RouteDecision):
+            self._record_route_decision(
+                decision,
+                task_id=prepared.task_id if isinstance(prepared, PreparedPrompt) else None,
+            )
         if isinstance(prepared, PreparedPrompt):
             self._active_machine_task_id = prepared.task_id
             self.hermes.sendPrompt(prepared.text)
@@ -546,7 +632,10 @@ class HalController(QObject):
             return
         try:
             self.machine_self.dispatch_outbox(
-                tts_available=self.tts.status != "error",
+                tts_available=(
+                    self.tts.status != "error"
+                    and self.config.voice.response_mode != "text_only"
+                ),
                 speak=self._speak_machine_phrase,
                 display=self._display_machine_phrase,
             )
@@ -569,12 +658,15 @@ class HalController(QObject):
         if self.audio.mode == "record":
             self.audio.stopRecording()
             return
+        self._voice_conversation = True
         self._capture_origin = "manual"
         self._transition(HalState.LISTENING, "manual microphone")
         self.audio.startRecording()
 
     @Slot()
     def stopGeneration(self) -> None:
+        self._voice_conversation = False
+        self._capture_origin = ""
         self._cancel_speech_output(suppress=True)
         self.hermes.cancel()
         self.state_machine.return_to_rest("generation stopped")
@@ -654,8 +746,21 @@ class HalController(QObject):
 
     @Slot(str, str)
     def selectHermesModel(self, provider: str, model: str) -> None:
+        if not model.strip():
+            self.config.hermes.router.enabled = True
+            self.model_router = TaskAwareModelRouter(self.config.hermes.router)
+            self._save_config()
+            self.configChanged.emit()
+            self.hermesModelsChanged.emit()
+            self.notification.emit("Automatic task-aware model routing enabled")
+            return
+        self.config.hermes.router.enabled = False
+        self.model_router = TaskAwareModelRouter(self.config.hermes.router)
         self.machine_self.expect_model_selection(provider, model)
         self.hermes.switchModel(provider, model)
+        self._save_config()
+        self.configChanged.emit()
+        self.hermesModelsChanged.emit()
 
     @Slot(str)
     def setHermesToken(self, token: str) -> None:
@@ -749,35 +854,66 @@ class HalController(QObject):
 
     @Slot(str, "QVariant")
     def updateSetting(self, dotted: str, value: object) -> None:
-        sections = {
-            "general": self.config.general,
-            "hermes": self.config.hermes,
-            "wake": self.config.wake,
-            "stt": self.config.stt,
-            "voice": self.config.voice,
-            "appearance": self.config.appearance,
-        }
-        section_name, separator, field_name = dotted.partition(".")
-        section = sections.get(section_name)
-        if not separator or section is None or not hasattr(section, field_name):
+        resolved = self._resolve_setting(dotted)
+        if resolved is None:
             self.notification.emit(f"Unknown setting: {dotted}")
             return
+        section, field_name = resolved
         current = getattr(section, field_name)
         try:
-            if isinstance(current, bool):
-                converted = bool(value)
-            elif isinstance(current, int) and not isinstance(current, bool):
-                converted = int(value)
-            elif isinstance(current, float):
-                converted = float(value)
-            else:
-                converted = str(value)
+            converted = self._convert_setting_value(current, value)
         except (TypeError, ValueError):
             self.notification.emit(f"Invalid value for {dotted}")
             return
         setattr(section, field_name, converted)
         self.config.normalize()
         self._apply_runtime_setting(dotted)
+        self._save_config()
+        self.configChanged.emit()
+        if dotted.startswith("appearance."):
+            self.appearanceChanged.emit()
+        elif dotted.startswith("voice."):
+            self.voiceSettingsChanged.emit()
+
+    @Slot(str, "QVariant")
+    def previewSetting(self, dotted: str, value: object) -> None:
+        """Apply a live control value without synchronously writing the config."""
+
+        resolved = self._resolve_setting(dotted)
+        if resolved is None:
+            self.notification.emit(f"Unknown setting: {dotted}")
+            return
+        section, field_name = resolved
+        current = getattr(section, field_name)
+        try:
+            converted = self._convert_setting_value(current, value)
+        except (TypeError, ValueError):
+            self.notification.emit(f"Invalid value for {dotted}")
+            return
+        setattr(section, field_name, converted)
+        self.config.normalize()
+        self._apply_runtime_setting(dotted)
+        self._pending_preview_settings.add(dotted)
+        self._setting_commit_timer.start()
+        if dotted.startswith("appearance."):
+            self.appearanceChanged.emit()
+        elif dotted.startswith("voice."):
+            self.voiceSettingsChanged.emit()
+
+    @Slot(str)
+    def commitSetting(self, dotted: str) -> None:
+        if dotted not in self._pending_preview_settings:
+            return
+        self._pending_preview_settings.discard(dotted)
+        if not self._pending_preview_settings:
+            self._setting_commit_timer.stop()
+        self._save_config()
+        self.configChanged.emit()
+
+    def _commit_preview_settings(self) -> None:
+        if not self._pending_preview_settings:
+            return
+        self._pending_preview_settings.clear()
         self._save_config()
         self.configChanged.emit()
 
@@ -1067,7 +1203,7 @@ class HalController(QObject):
         self._maybe_finish_speech()
 
     def _queue_speech_chunks(self, chunks: list[str]) -> None:
-        if self._speech_suppressed:
+        if self._speech_suppressed or not self._speech_allowed():
             return
         for chunk in chunks:
             clean = chunk.strip()
@@ -1082,6 +1218,8 @@ class HalController(QObject):
     def _flush_guarded_speech(self) -> None:
         guarded = tuple(self._speech_guarded_chunks)
         self._speech_guarded_chunks.clear()
+        if not self._speech_allowed():
+            return
         for chunk in guarded:
             clean = chunk
             if self.machine_self.database is not None:
@@ -1106,7 +1244,12 @@ class HalController(QObject):
             return
         self._speech_turn_finished = True
         self.audio.setSpeaking(False)
-        if self._voice_conversation and not self.manualOpen:
+        if self._capture_origin == "manual":
+            self._voice_conversation = False
+            self._capture_origin = ""
+            self.state_machine.return_to_rest("speech complete")
+            self.touchManual()
+        elif self._voice_conversation and not self.manualOpen:
             self._schedule(650, self._continue_voice_conversation)
         else:
             self.state_machine.return_to_rest("speech complete")
@@ -1245,7 +1388,18 @@ class HalController(QObject):
     def _set_hermes_model_options(self, payload: dict[str, Any]) -> None:
         current_provider = str(payload.get("provider") or self._hermes_model_provider)
         current_model = str(payload.get("model") or self._hermes_model_name)
-        options: list[dict[str, Any]] = []
+        options: list[dict[str, Any]] = [
+            {
+                "label": "AUTOMATIC  //  TERRA NORMAL · SOL COMPLEX",
+                "provider": "",
+                "providerName": "HAL ROUTER",
+                "model": "",
+                "modelLabel": "TERRA NORMAL · SOL COMPLEX",
+                "available": True,
+                "authenticated": True,
+                "local": False,
+            }
+        ]
         for provider in payload.get("providers") or []:
             if not isinstance(provider, dict):
                 continue
@@ -1254,15 +1408,30 @@ class HalController(QObject):
             for raw_model in provider.get("models") or []:
                 if isinstance(raw_model, dict):
                     model = str(raw_model.get("id") or raw_model.get("name") or "").strip()
+                    available = bool(raw_model.get("available", True))
+                    authenticated = bool(raw_model.get("authenticated", True))
+                    local = bool(raw_model.get("local", False))
                 else:
                     model = str(raw_model).strip()
+                    available = True
+                    authenticated = True
+                    local = slug.lower() in {"ollama", "qwen-ollama", "local"}
                 if not model:
                     continue
+                estimate = self.config.hermes.router.local_model_memory_mb.get(
+                    f"{slug}/{model}"
+                )
                 options.append(
                     {
                         "label": f"{name}  //  {model}",
                         "provider": slug,
+                        "providerName": name,
                         "model": model,
+                        "modelLabel": model,
+                        "available": available,
+                        "authenticated": authenticated,
+                        "local": local,
+                        "residentMemoryMb": estimate,
                     }
                 )
         if current_model and not any(
@@ -1270,17 +1439,26 @@ class HalController(QObject):
             for item in options
         ):
             options.insert(
-                0,
+                1,
                 {
                     "label": f"{current_provider or 'Hermes'}  //  {current_model}",
                     "provider": current_provider,
+                    "providerName": current_provider or "Hermes",
                     "model": current_model,
+                    "modelLabel": current_model,
+                    "available": False,
+                    "authenticated": False,
+                    "local": current_provider.lower() in {"ollama", "qwen-ollama", "local"},
+                    "residentMemoryMb": self.config.hermes.router.local_model_memory_mb.get(
+                        f"{current_provider}/{current_model}"
+                    ),
                 },
             )
         self._hermes_models = options
-        self._hermes_model_provider = current_provider
-        self._hermes_model_name = current_model
-        if current_model and not self.config.hermes.model:
+        if not self.config.hermes.router.enabled or not self._hermes_model_name:
+            self._hermes_model_provider = current_provider
+            self._hermes_model_name = current_model
+        if current_model and not self.config.hermes.model and not self.config.hermes.router.enabled:
             self.config.hermes.provider = current_provider
             self.config.hermes.model = current_model
             self._save_config()
@@ -1290,22 +1468,41 @@ class HalController(QObject):
     def _hermes_model_changed(self, provider: str, model: str) -> None:
         self._hermes_model_provider = provider
         self._hermes_model_name = model
-        self.config.hermes.provider = provider
-        self.config.hermes.model = model
-        self._save_config()
-        self.configChanged.emit()
+        if not self.config.hermes.router.enabled:
+            self.config.hermes.provider = provider
+            self.config.hermes.model = model
+            self._save_config()
+            self.configChanged.emit()
         self.hermesModelsChanged.emit()
-        self.notification.emit(f"Hermes model selected: {model}")
+        if not self.config.hermes.router.enabled:
+            self.notification.emit(f"Hermes model selected: {model}")
+
+    def _hermes_active_model_changed(self, provider: str, model: str) -> None:
+        """Reflect structured runtime observation without changing user intent."""
+
+        self._hermes_model_provider = provider
+        self._hermes_model_name = model
+        self.hermesModelsChanged.emit()
 
     def _hermes_reasoning_changed(self, effort: str) -> None:
-        self.config.hermes.reasoning_effort = effort
-        self._save_config()
-        self.configChanged.emit()
+        self._hermes_reasoning_effort = effort
+        if not self.config.hermes.router.enabled:
+            self.config.hermes.reasoning_effort = effort
+            self._save_config()
+            self.configChanged.emit()
+        self.hermesModelsChanged.emit()
+
+    def _hermes_active_reasoning_changed(self, effort: str) -> None:
+        self._hermes_reasoning_effort = effort
         self.hermesModelsChanged.emit()
 
     def _model_operation_error(self, message: str) -> None:
         self._record_error("Hermes model: " + message)
         self.notification.emit(message)
+
+    def _self_mcp_degraded(self, message: str) -> None:
+        self._record_error("Hermes self MCP: " + message)
+        self.notification.emit(message + " — chat remains available")
 
     def _detect_cuda(self) -> None:
         status = "CPU"
@@ -1321,6 +1518,76 @@ class HalController(QObject):
     def _set_cuda_status(self, status: str) -> None:
         self._cuda_status = status
         self.subsystemChanged.emit()
+
+    def _route_prompt(self, prompt: str) -> RouteDecision:
+        inventory = tuple(
+            ModelOption(
+                provider=str(item.get("provider") or ""),
+                model=str(item.get("model") or ""),
+                provider_name=str(item.get("providerName") or ""),
+                authenticated=bool(item.get("authenticated", True)),
+                available=bool(item.get("available", True)),
+                local=bool(item.get("local", False)),
+                resident_memory_mb=(
+                    int(item["residentMemoryMb"])
+                    if item.get("residentMemoryMb") is not None
+                    else None
+                ),
+            )
+            for item in self._hermes_models
+            if item.get("model")
+        )
+        decision = self.model_router.decide(
+            prompt,
+            inventory,
+            manual_provider=self.config.hermes.provider,
+            manual_model=self.config.hermes.model,
+            resources=self._resource_snapshot(),
+        )
+        self._last_route_decision = decision
+        if decision.available:
+            self.machine_self.expect_model_selection(decision.provider, decision.model)
+            self.hermes.ensureRoute(
+                decision.provider,
+                decision.model,
+                decision.reasoning,
+                allow_hermes_fallback=(
+                    self.config.hermes.router.resource_policy != "offline_local"
+                ),
+            )
+        return decision
+
+    def _record_route_decision(
+        self, decision: RouteDecision, *, task_id: str | None = None
+    ) -> None:
+        future = self.machine_self.observe_hermes_event(
+            {
+                "type": "hal.model.route.decided",
+                "session_id": self.hermes.sessionId,
+                "payload": {**decision.event_payload(), "task_id": task_id},
+            }
+        )
+        if future is not None:
+            future.add_done_callback(self._machine_background_done)
+
+    @staticmethod
+    def _resource_snapshot() -> ResourceSnapshot:
+        free_ram_mb = 0
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                if line.startswith("MemAvailable:"):
+                    free_ram_mb = int(line.split()[1]) // 1024
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
+        # GPU probing is intentionally absent from the pre-turn hot path. A
+        # local route must fit current host RAM unless an explicit lightweight
+        # telemetry source later supplies fresh VRAM evidence.
+        return ResourceSnapshot(free_ram_mb, 0, time.monotonic())
+
+    def _speech_allowed(self) -> bool:
+        mode = self.config.voice.response_mode
+        return mode == "always" or (mode == "voice_prompts" and self._voice_conversation)
 
     def _hermes_status_changed(self, status: str) -> None:
         self.subsystemChanged.emit()
@@ -1432,6 +1699,40 @@ class HalController(QObject):
         self._save_config()
         self.firstRunChanged.emit(False)
 
+    def _resolve_setting(self, dotted: str) -> tuple[object, str] | None:
+        parts = dotted.split(".")
+        if len(parts) < 2:
+            return None
+        sections: dict[str, object] = {
+            "general": self.config.general,
+            "hermes": self.config.hermes,
+            "operator": self.config.operator,
+            "wake": self.config.wake,
+            "stt": self.config.stt,
+            "voice": self.config.voice,
+            "appearance": self.config.appearance,
+        }
+        target = sections.get(parts[0])
+        if target is None:
+            return None
+        for part in parts[1:-1]:
+            if not hasattr(target, part):
+                return None
+            target = getattr(target, part)
+        return (target, parts[-1]) if hasattr(target, parts[-1]) else None
+
+    @staticmethod
+    def _convert_setting_value(current: object, value: object) -> object:
+        if isinstance(current, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+        if isinstance(current, int):
+            return int(value)
+        if isinstance(current, float):
+            return float(value)
+        return str(value)
+
     def _apply_runtime_setting(self, dotted: str) -> None:
         if dotted == "general.launch_on_login":
             try:
@@ -1445,6 +1746,12 @@ class HalController(QObject):
             self.hermes.apply_settings()
         elif dotted == "hermes.reasoning_effort":
             self.hermes.setReasoning(self.config.hermes.reasoning_effort)
+        elif dotted.startswith("hermes.router."):
+            self.model_router = TaskAwareModelRouter(self.config.hermes.router)
+        elif dotted == "operator.preferred_name":
+            self.machine_self.update_operator_preferred_name(
+                self.config.operator.preferred_name
+            )
         elif dotted == "voice.mode":
             self.tts.set_mode(self.config.voice.mode)
         elif dotted == "voice.volume":

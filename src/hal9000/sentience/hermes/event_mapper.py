@@ -194,6 +194,21 @@ class HermesEventMapper:
             return
         payload = raw_payload if isinstance(raw_payload, dict) else {}
         task_id = self._task_by_session.get(session_id) or self._task_by_session.get("pending")
+        if event_type == "hal.model.route.decided":
+            route_task_id = (
+                str(payload.get("task_id") or "").strip() or None
+                if "task_id" in payload
+                else task_id
+            )
+            self._record_model_route(
+                payload, session_id=session_id, task_id=route_task_id
+            )
+            return
+        if event_type == "hal.model.provider_health.changed":
+            self._record_model_provider_health(
+                payload, session_id=session_id, task_id=task_id
+            )
+            return
         if event_type == "session.info":
             self.bind_pending_task(session_id)
             task_id = self._task_by_session.get(session_id)
@@ -940,6 +955,119 @@ class HermesEventMapper:
             idempotency_key=idempotency_key,
         )
         return self.event_bus.publish_exact(event).result(timeout=10)
+
+    def _record_model_route(
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        task_id: str | None,
+    ) -> StoredEvent:
+        bounded, _digest, _size, _truncated = bounded_redacted_record(
+            payload, maximum_bytes=32 * 1024
+        )
+        decision_id = str(bounded.get("decision_id") or "").strip()
+        if not decision_id:
+            raise ValueError("model route decision requires a decision_id")
+        event = EventEnvelope.new(
+            boot_id=self.boot_id,
+            source="hal.model_router",
+            event_type="model.route.decided",
+            subject=canonical_subject(
+                str(bounded.get("model") or "unavailable"), fallback="model_route"
+            ),
+            severity=Severity.INFO if bool(bounded.get("available")) else Severity.WARNING,
+            retention_class=RetentionClass.FOREVER,
+            sensitivity=Sensitivity.INTERNAL,
+            origin=EventOrigin.CONFIGURATION,
+            payload=bounded,
+            task_id=task_id,
+            idempotency_key=f"model-route:{decision_id}",
+        )
+
+        def projection(connection, _sequence: int) -> None:
+            connection.execute(
+                "INSERT INTO model_route_decisions("
+                "decision_id,task_id,session_id,intent_class,policy_version,"
+                "selected_profile,selected_provider,selected_model,reasoning_effort,"
+                "user_override,available,reason,rejected_candidates_json,evidence_event_id,"
+                "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    decision_id,
+                    task_id,
+                    session_id or None,
+                    str(bounded.get("intent_class") or "unknown")[:64],
+                    int(bounded.get("policy_version") or 1),
+                    str(bounded.get("selected_profile") or "")[:255],
+                    str(bounded.get("provider") or "")[:255],
+                    str(bounded.get("model") or "")[:512],
+                    str(bounded.get("reasoning") or "medium")[:32],
+                    int(bool(bounded.get("user_override"))),
+                    int(bool(bounded.get("available"))),
+                    str(bounded.get("reason") or "")[:2000],
+                    json.dumps(
+                        list(bounded.get("rejected_candidates") or [])[:64],
+                        separators=(",", ":"),
+                    ),
+                    event.event_id,
+                    event.occurred_at_utc,
+                ),
+            )
+
+        return self.database.append_exact_event(event, projection=projection)
+
+    def _record_model_provider_health(
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        task_id: str | None,
+    ) -> StoredEvent:
+        bounded, _digest, _size, _truncated = bounded_redacted_record(
+            payload, maximum_bytes=16 * 1024
+        )
+        provider = str(bounded.get("provider") or "").strip()
+        model = str(bounded.get("model") or "").strip()
+        state = str(bounded.get("state") or "unknown").strip().lower()
+        transition_id = str(bounded.get("health_transition_id") or "").strip()
+        if not model or not transition_id:
+            raise ValueError("provider health transition requires model and transition ID")
+        event = EventEnvelope.new(
+            boot_id=self.boot_id,
+            source="hermes.model_router",
+            event_type="model.provider.health.changed",
+            subject=canonical_subject(model, fallback="model_provider"),
+            severity=Severity.WARNING if state in {"cooldown", "unavailable", "unauthenticated"} else Severity.INFO,
+            retention_class=RetentionClass.FOREVER,
+            sensitivity=Sensitivity.INTERNAL,
+            origin=EventOrigin.OBSERVATION,
+            payload=bounded,
+            task_id=task_id,
+            idempotency_key=f"model-provider-health:{transition_id}",
+        )
+
+        def projection(connection, _sequence: int) -> None:
+            connection.execute(
+                "INSERT INTO model_provider_health("
+                "provider,model,state,observed_at,freshness_deadline,cooldown_until,"
+                "evidence_event_id,detail) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(provider,model) DO UPDATE SET state=excluded.state,"
+                "observed_at=excluded.observed_at,freshness_deadline=excluded.freshness_deadline,"
+                "cooldown_until=excluded.cooldown_until,evidence_event_id=excluded.evidence_event_id,"
+                "detail=excluded.detail",
+                (
+                    provider,
+                    model,
+                    state,
+                    event.occurred_at_utc,
+                    None,
+                    str(bounded.get("cooldownUntil") or "") or None,
+                    event.event_id,
+                    str(bounded.get("detail") or "")[:1000],
+                ),
+            )
+
+        return self.database.append_exact_event(event, projection=projection)
 
     def _is_currently_degraded(self) -> bool:
         return self.degradation.status().state.value in {"DEGRADED", "RECOVERING"}

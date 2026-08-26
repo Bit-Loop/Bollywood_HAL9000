@@ -151,6 +151,19 @@ def test_compact_self_capsule_keeps_exact_state_first_and_stays_under_budget(
             context_usage=ContextInput(1000, 800, 1200, 0, 32_000, 0, None),
         )
         assert f"fact:{fact.fact_id}" in memory_capsule.evidence_handles
+
+        named_capsule = ContextCompiler(
+            database, config, operator_preferred_name="Isaiah"
+        ).compile(
+            task_id=task_id,
+            query="",
+            token_budget=config.retrieval.self_capsule_tokens,
+        )
+        assert named_capsule.data["operator"] == {
+            "preferred_name": "Isaiah",
+            "source": "user_configuration",
+            "authority": False,
+        }
     finally:
         database.close()
 

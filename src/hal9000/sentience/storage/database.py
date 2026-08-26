@@ -31,6 +31,15 @@ from hal9000.sentience.models import (
 
 Projection = Callable[[sqlite3.Connection, int], None]
 
+_KNOWN_EQUIVALENT_MIGRATION_CHECKSUMS: dict[int, frozenset[str]] = {
+    2: frozenset(
+        {
+            "sha256:ae52ae2a0dd1d3f6ba0828b0019ece9caad3c841b61102cd616e503ffd572e45",
+            "sha256:e090cfc8eda7db67ebe4432fa995eb8f7a3310a1eab5404c4071459105164ffe",
+        }
+    )
+}
+
 
 @dataclass(frozen=True, slots=True)
 class StorageBudget:
@@ -146,8 +155,12 @@ class SentienceDatabase:
                 raise RuntimeError(f"applied migration {version} has no source file")
             source = path.read_bytes()
             expected = "sha256:" + hashlib.sha256(source).hexdigest()
-            if str(row["checksum"]) != expected:
-                raise RuntimeError(f"migration checksum drift detected at version {version}")
+            actual = str(row["checksum"])
+            if actual != expected:
+                equivalents = _KNOWN_EQUIVALENT_MIGRATION_CHECKSUMS.get(version, frozenset())
+                if actual not in equivalents or expected not in equivalents:
+                    raise RuntimeError(f"migration checksum drift detected at version {version}")
+                self._verify_equivalent_migration_schema(version)
         pending = [(version, path) for version, path in migrations if version > current]
         if not pending:
             return
@@ -194,6 +207,27 @@ class SentienceDatabase:
                 except sqlite3.OperationalError:
                     pass
                 raise
+
+    def _verify_equivalent_migration_schema(self, version: int) -> None:
+        """Fail closed when accepting a byte-different but known SQL migration.
+
+        Version 2 differed only by a trailing newline in one released build.
+        The alias is accepted only when the exact schema effect is present.
+        """
+
+        if version != 2:
+            raise RuntimeError(
+                f"migration {version} has no equivalent-schema verification rule"
+            )
+        columns = {
+            str(row[1])
+            for row in self.writer.execute("PRAGMA table_info(degradation_episodes)")
+        }
+        if "required_capabilities_json" not in columns:
+            raise RuntimeError(
+                "migration 2 checksum alias failed schema verification: "
+                "degradation_episodes.required_capabilities_json is missing"
+            )
 
     def _fts5_available(self) -> bool:
         try:

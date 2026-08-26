@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import shlex
 import hashlib
+import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -42,8 +44,13 @@ class HermesService(QObject):
     integrationsChanged = Signal(list)
     modelOptionsReady = Signal(dict)
     modelChanged = Signal(str, str)
+    activeModelChanged = Signal(str, str)
     reasoningChanged = Signal(str)
+    activeReasoningChanged = Signal(str)
     modelOperationError = Signal(str)
+    selfMcpStatusChanged = Signal(str)
+    selfMcpDegraded = Signal(str)
+    routeHealthChanged = Signal(dict)
     structuredEvent = Signal(dict)
     _probeFinished = Signal(object)
 
@@ -70,25 +77,36 @@ class HermesService(QObject):
         self._latency = 0.0
         self._runtime_session_id = ""
         self._stored_session_id = settings.last_session_id
+        self._session_request = ""
         self._queued_prompt = ""
         self._ws_url = ""
         self._token = token
         self._want_running = False
         self._probe_pending = False
         self._restart_attempts = 0
-        self._model_switch_requests: dict[str, tuple[int, str, str]] = {}
-        self._reasoning_requests: dict[str, tuple[int, str]] = {}
+        self._model_switch_requests: dict[str, tuple[int, str, str, bool, bool]] = {}
+        self._reasoning_requests: dict[str, tuple[int, str, bool, bool]] = {}
         self._preference_generation = 0
         self._preference_state = "unconfigured"
         self._desired_provider = settings.provider
         self._desired_model = settings.model
         self._desired_reasoning = settings.reasoning_effort
+        self._persist_route_selection = True
+        self._allow_hermes_fallback = True
         self._preferences_pending = False
         self._preferences_failed = False
         self._self_mcp_enabled = False
         self._self_mcp = SelfMcpRegistration()
         self._self_mcp_request = ""
         self._self_mcp_stage = "idle"
+        self._self_mcp_status = "disabled"
+        self._self_mcp_retry_attempts = 0
+        self._self_mcp_last_error = ""
+        self._self_mcp_reload_request = ""
+        self._backend_failures: deque[float] = deque()
+        self._active_provider = ""
+        self._active_model = ""
+        self._provider_health: dict[str, dict[str, Any]] = {}
         self._probe_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hal9000-hermes-probe"
         )
@@ -96,6 +114,12 @@ class HermesService(QObject):
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
         self._restart_timer.timeout.connect(self._restart_owned_backend)
+        self._restart_stability_timer = QTimer(self)
+        self._restart_stability_timer.setSingleShot(True)
+        self._restart_stability_timer.timeout.connect(self._reset_restart_budget)
+        self._self_mcp_retry_timer = QTimer(self)
+        self._self_mcp_retry_timer.setSingleShot(True)
+        self._self_mcp_retry_timer.timeout.connect(self._retry_self_mcp)
 
     @Property(str, notify=statusChanged)
     def status(self) -> str:
@@ -116,6 +140,14 @@ class HermesService(QObject):
     @Property(str, constant=True)
     def executable(self) -> str:
         return str(self.installation.executable or "")
+
+    @Property(str, notify=selfMcpStatusChanged)
+    def selfMcpStatus(self) -> str:
+        return self._self_mcp_status
+
+    @Property("QVariantMap", notify=routeHealthChanged)
+    def routeHealth(self) -> dict[str, Any]:
+        return {key: dict(value) for key, value in self._provider_health.items()}
 
     @Slot()
     def start(self) -> None:
@@ -155,6 +187,8 @@ class HermesService(QObject):
     def stop(self) -> None:
         self._want_running = False
         self._restart_timer.stop()
+        self._restart_stability_timer.stop()
+        self._self_mcp_retry_timer.stop()
         self._preference_generation += 1
         self._preference_state = "unconfigured"
         self._preferences_pending = False
@@ -166,6 +200,10 @@ class HermesService(QObject):
             self._queued_prompt = ""
         self._self_mcp_stage = "idle"
         self._self_mcp_request = ""
+        self._self_mcp_reload_request = ""
+        self._session_request = ""
+        self._self_mcp_retry_attempts = 0
+        self._set_self_mcp_status("disabled" if not self._self_mcp_enabled else "idle")
         self.client.close()
         if self.process is not None:
             self.process.stop()
@@ -181,6 +219,7 @@ class HermesService(QObject):
     def enableSelfMcp(self) -> None:
         """Install HAL's narrow MCP server through Hermes' supported RPCs."""
         self._self_mcp_enabled = True
+        self._set_self_mcp_status("idle")
 
     def apply_settings(self) -> None:
         was_running = self._want_running
@@ -276,7 +315,42 @@ class HermesService(QObject):
         self._desired_provider = clean_provider
         self._desired_model = clean_model
         self._desired_reasoning = self.settings.reasoning_effort
+        self._persist_route_selection = True
         self._begin_preference_workflow()
+
+    def ensureRoute(
+        self,
+        provider: str,
+        model: str,
+        reasoning: str,
+        *,
+        allow_hermes_fallback: bool = True,
+    ) -> None:
+        """Apply a desired pre-turn route without restarting Hermes' agent loop."""
+
+        clean_provider = provider.strip()
+        clean_model = model.strip()
+        clean_reasoning = reasoning.strip().lower() or "medium"
+        if not clean_model:
+            self.modelOperationError.emit(
+                "No available model satisfies the active routing policy"
+            )
+            return
+        if (
+            clean_provider == self._desired_provider
+            and clean_model == self._desired_model
+            and clean_reasoning == self._desired_reasoning
+            and allow_hermes_fallback == self._allow_hermes_fallback
+            and self._preference_state in {"ready", "applying"}
+        ):
+            return
+        self._desired_provider = clean_provider
+        self._desired_model = clean_model
+        self._desired_reasoning = clean_reasoning
+        self._persist_route_selection = False
+        self._allow_hermes_fallback = allow_hermes_fallback
+        if self._runtime_session_id and self.client.connected:
+            self._begin_preference_workflow()
 
     def _begin_preference_workflow(self) -> None:
         self._preference_generation += 1
@@ -321,7 +395,13 @@ class HermesService(QObject):
             },
             120_000,
         )
-        self._model_switch_requests[request_id] = (generation, provider, model)
+        self._model_switch_requests[request_id] = (
+            generation,
+            provider,
+            model,
+            self._persist_route_selection,
+            self._allow_hermes_fallback,
+        )
 
     @Slot(str)
     def setReasoning(self, effort: str) -> None:
@@ -356,7 +436,12 @@ class HermesService(QObject):
             },
             60_000,
         )
-        self._reasoning_requests[request_id] = (generation, effort)
+        self._reasoning_requests[request_id] = (
+            generation,
+            effort,
+            self._persist_route_selection,
+            self._allow_hermes_fallback,
+        )
 
     @Slot(str, str)
     def respondApproval(self, request_id: str, choice: str) -> None:
@@ -423,7 +508,6 @@ class HermesService(QObject):
         self.process.start()
 
     def _on_backend_ready(self, _base_url: str, ws_url: str) -> None:
-        self._restart_attempts = 0
         self._ws_url = ws_url
         self.client.connectTo(ws_url)
 
@@ -436,8 +520,17 @@ class HermesService(QObject):
             "offline": "offline",
         }
         self._set_status(state_map.get(state, state))
+        if state != "connected":
+            self._session_request = ""
+            self._restart_stability_timer.stop()
+        if state != "connected" and self._self_mcp_stage == "reloading":
+            self._self_mcp_reload_request = ""
+            self._self_mcp_stage = "degraded"
+            self._set_self_mcp_status("degraded")
         if state == "connected":
-            self._restart_attempts = 0
+            self._restart_stability_timer.start(
+                int(self.settings.router.recovery_stability_seconds * 1000)
+            )
             if self._self_mcp_enabled:
                 if self._self_mcp_stage == "ready":
                     self._create_or_resume_session()
@@ -447,9 +540,12 @@ class HermesService(QObject):
                 self._create_or_resume_session()
 
     def _ensure_self_mcp(self) -> None:
-        if self._self_mcp_stage not in {"idle", "failed"}:
+        if self._self_mcp_stage not in {"idle", "failed", "degraded", "retrying"}:
             return
         self._self_mcp_stage = "listing"
+        self._set_self_mcp_status(
+            "retrying" if self._self_mcp_retry_attempts else "initializing"
+        )
         self._self_mcp_request = self.client.request(
             "mcp.servers.list",
             **({"params": {"profile": self.settings.profile}} if self.settings.profile else {}),
@@ -472,28 +568,76 @@ class HermesService(QObject):
         self._self_mcp_request = self.client.request("mcp.servers.test", params, 60_000)
 
     def _finish_self_mcp_setup(self) -> None:
+        self._self_mcp_request = ""
+        self._self_mcp_retry_timer.stop()
+        if self._runtime_session_id:
+            self._self_mcp_stage = "reloading"
+            self._set_self_mcp_status("reloading")
+            self._self_mcp_reload_request = self.client.request(
+                "reload.mcp",
+                {"session_id": self._runtime_session_id, "confirm": True},
+                120_000,
+            )
+        else:
+            self._mark_self_mcp_ready()
+            self._create_or_resume_session()
+
+    def _mark_self_mcp_ready(self) -> None:
         self._self_mcp_stage = "ready"
         self._self_mcp_request = ""
-        self._create_or_resume_session()
+        self._self_mcp_reload_request = ""
+        self._self_mcp_retry_attempts = 0
+        self._self_mcp_last_error = ""
+        self._self_mcp_retry_timer.stop()
+        self._set_self_mcp_status("ready")
+
+    def _self_mcp_failed(self, detail: str) -> None:
+        self._self_mcp_stage = "degraded"
+        self._self_mcp_request = ""
+        self._self_mcp_last_error = detail[:1000]
+        self._self_mcp_retry_attempts += 1
+        self._set_self_mcp_status("degraded")
+        self.selfMcpDegraded.emit("HAL self MCP failed its Hermes probe: " + detail)
+        if not self._runtime_session_id:
+            self._create_or_resume_session()
+        if not self.client.connected or not self.settings.router.auto_recovery:
+            return
+        delay_seconds = min(
+            int(self.settings.router.self_mcp_retry_max_seconds),
+            2 ** max(0, self._self_mcp_retry_attempts - 1),
+        )
+        self._self_mcp_retry_timer.start(delay_seconds * 1000)
+
+    def _retry_self_mcp(self) -> None:
+        if not self._self_mcp_enabled or not self.client.connected:
+            return
+        self._self_mcp_stage = "retrying"
+        self._set_self_mcp_status("retrying")
+        self._ensure_self_mcp()
 
     def _create_or_resume_session(self) -> None:
+        if self._session_request:
+            return
+        self._session_request = "pending"
         if self._stored_session_id:
-            self.client.request(
+            request_id = self.client.request(
                 "session.resume",
                 {"session_id": self._stored_session_id, "profile": self.settings.profile},
             )
-            return
-        self.client.request(
-            "session.create",
-            {
-                "cwd": str(self.cwd),
-                "profile": self.settings.profile,
-                "source": "desktop",
-                "title": "HAL 9000",
-                "close_on_disconnect": False,
-                "cols": 100,
-            },
-        )
+        else:
+            request_id = self.client.request(
+                "session.create",
+                {
+                    "cwd": str(self.cwd),
+                    "profile": self.settings.profile,
+                    "source": "desktop",
+                    "title": "HAL 9000",
+                    "close_on_disconnect": False,
+                    "cols": 100,
+                },
+            )
+        if self._session_request == "pending":
+            self._session_request = request_id
 
     def _on_rpc_result(self, request_id: str, method: str, result: Any) -> None:
         payload = result if isinstance(result, dict) else {}
@@ -521,12 +665,29 @@ class HermesService(QObject):
             self._request_self_mcp_test()
         elif request_id == self._self_mcp_request and method == "mcp.servers.test":
             if not bool(payload.get("ok")):
-                self.errorOccurred.emit(
-                    "HAL self MCP failed its Hermes probe: "
-                    + str(payload.get("error") or "unknown error")
+                self._self_mcp_failed(str(payload.get("error") or "unknown error"))
+            else:
+                self._finish_self_mcp_setup()
+        elif request_id == self._self_mcp_reload_request and method == "reload.mcp":
+            self._self_mcp_reload_request = ""
+            status = str(payload.get("status") or "").strip().lower()
+            if status == "confirm_required":
+                message = str(
+                    payload.get("message")
+                    or "Hermes requires confirmation to reload MCP tools"
                 )
-            self._finish_self_mcp_setup()
+                self.selfMcpDegraded.emit(message)
+                self._self_mcp_stage = "approval_required"
+                self._self_mcp_last_error = message[:1000]
+                self._set_self_mcp_status("approval required")
+            elif payload.get("ok") is False or status in {"error", "failed"}:
+                self._self_mcp_failed(
+                    str(payload.get("error") or payload.get("message") or "reload failed")
+                )
+            else:
+                self._mark_self_mcp_ready()
         elif method in {"session.create", "session.resume"}:
+            self._session_request = ""
             self._runtime_session_id = str(payload.get("session_id") or "")
             self._stored_session_id = str(
                 payload.get("stored_session_id") or payload.get("session_key") or self._stored_session_id
@@ -536,18 +697,39 @@ class HermesService(QObject):
             info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
             tools = info.get("tools") if isinstance(info.get("tools"), dict) else {}
             self.integrationsChanged.emit(sorted(map(str, tools.keys())))
-            self._desired_provider = self.settings.provider
-            self._desired_model = self.settings.model
-            self._desired_reasoning = self.settings.reasoning_effort
             self._begin_preference_workflow()
         elif method == "model.options":
             logging.getLogger("hal9000.hermes").info(
                 "Hermes model inventory loaded: %d providers",
                 len(payload.get("providers") or []),
             )
+            for provider_row in payload.get("providers") or []:
+                if not isinstance(provider_row, dict):
+                    continue
+                provider = str(provider_row.get("slug") or "")
+                authenticated = bool(provider_row.get("authenticated", True))
+                for raw_model in provider_row.get("models") or []:
+                    model = str(
+                        raw_model.get("id") or raw_model.get("name") or ""
+                        if isinstance(raw_model, dict)
+                        else raw_model
+                    ).strip()
+                    if model:
+                        self._mark_provider_health(
+                            provider,
+                            model,
+                            "available" if authenticated else "unauthenticated",
+                            "model.options",
+                        )
             self.modelOptionsReady.emit(payload)
         elif method == "config.set" and request_id in self._model_switch_requests:
-            generation, provider, model = self._model_switch_requests.pop(request_id)
+            (
+                generation,
+                provider,
+                model,
+                persist_selection,
+                allow_hermes_fallback,
+            ) = self._model_switch_requests.pop(request_id)
             if generation != self._preference_generation:
                 return
             warning = str(payload.get("warning") or "").strip()
@@ -557,14 +739,22 @@ class HermesService(QObject):
                     or "Hermes requires confirmation for this model"
                 )
                 self.modelOperationError.emit(message)
-                self._fail_preference_workflow(generation, message)
+                if persist_selection or not allow_hermes_fallback:
+                    self._fail_preference_workflow(generation, message)
+                else:
+                    self._finish_session_preferences(generation, retry_route=True)
                 return
             if warning and "failed" in warning.lower():
                 self.modelOperationError.emit(warning)
-                self._fail_preference_workflow(generation, warning)
+                if persist_selection or not allow_hermes_fallback:
+                    self._fail_preference_workflow(generation, warning)
+                else:
+                    self._mark_provider_health(provider, model, "unavailable", warning)
+                    self._finish_session_preferences(generation, retry_route=True)
                 return
-            self.settings.provider = provider
-            self.settings.model = model
+            if persist_selection:
+                self.settings.provider = provider
+                self.settings.model = model
             logging.getLogger("hal9000.hermes").info(
                 "HAL session model selected: %s // %s", provider or "automatic", model
             )
@@ -574,10 +764,31 @@ class HermesService(QObject):
             else:
                 self._finish_session_preferences(generation)
         elif method == "config.set" and request_id in self._reasoning_requests:
-            generation, effort = self._reasoning_requests.pop(request_id)
+            (
+                generation,
+                effort,
+                persist_selection,
+                allow_hermes_fallback,
+            ) = self._reasoning_requests.pop(request_id)
             if generation != self._preference_generation:
                 return
-            self.settings.reasoning_effort = effort
+            warning = str(payload.get("warning") or "").strip()
+            if bool(payload.get("confirm_required")) or (
+                warning and "failed" in warning.lower()
+            ):
+                message = str(
+                    payload.get("confirm_message")
+                    or warning
+                    or "Hermes requires confirmation for this reasoning effort"
+                )
+                self.modelOperationError.emit(message)
+                if persist_selection or not allow_hermes_fallback:
+                    self._fail_preference_workflow(generation, message)
+                else:
+                    self._finish_session_preferences(generation, retry_route=True)
+                return
+            if persist_selection:
+                self.settings.reasoning_effort = effort
             logging.getLogger("hal9000.hermes").info(
                 "HAL session reasoning selected: %s", effort
             )
@@ -590,11 +801,14 @@ class HermesService(QObject):
         self, request_id: str, method: str, message: str, _code: int
     ) -> None:
         if request_id == self._self_mcp_request and method.startswith("mcp.servers."):
-            self._self_mcp_stage = "failed"
-            self._self_mcp_request = ""
-            self.errorOccurred.emit(f"HAL self MCP registration failed: {message}")
-            self._create_or_resume_session()
+            self._self_mcp_failed(f"registration failed: {message}")
             return
+        if request_id == self._self_mcp_reload_request and method == "reload.mcp":
+            self._self_mcp_reload_request = ""
+            self._self_mcp_failed(f"session reload failed: {message}")
+            return
+        if method in {"session.create", "session.resume"}:
+            self._session_request = ""
         if method == "session.resume" and self._stored_session_id:
             self._stored_session_id = ""
             self._runtime_session_id = ""
@@ -611,7 +825,25 @@ class HermesService(QObject):
             if generation != self._preference_generation:
                 return
             self.modelOperationError.emit(message)
-            self._fail_preference_workflow(generation, message)
+            persist_selection = bool(
+                model_workflow[3] if model_workflow else reasoning_workflow[2]
+            )
+            allow_hermes_fallback = (
+                bool(model_workflow[4])
+                if model_workflow
+                else bool(reasoning_workflow[3])
+            )
+            if persist_selection or not allow_hermes_fallback:
+                self._fail_preference_workflow(generation, message)
+            else:
+                if model_workflow:
+                    self._mark_provider_health(
+                        str(model_workflow[1]),
+                        str(model_workflow[2]),
+                        "unavailable",
+                        message,
+                    )
+                self._finish_session_preferences(generation, retry_route=True)
             return
         self.errorOccurred.emit(message)
 
@@ -620,13 +852,16 @@ class HermesService(QObject):
         generation: int | None = None,
         deliver_queued: bool = True,
         failure: str = "",
+        retry_route: bool = False,
     ) -> None:
         active_generation = self._preference_generation if generation is None else generation
         if active_generation != self._preference_generation:
             return
         self._preferences_pending = False
         self._preferences_failed = not deliver_queued
-        self._preference_state = "ready" if deliver_queued else "failed"
+        self._preference_state = (
+            "retryable" if retry_route else "ready" if deliver_queued else "failed"
+        )
         # A disconnected client reports request errors synchronously. Avoid a
         # model.options -> error -> finish -> model.options recursion while the
         # transport is unwinding.
@@ -676,6 +911,22 @@ class HermesService(QObject):
         self.structuredEvent.emit(dict(event))
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         if event_type == "session.info":
+            provider = str(payload.get("provider") or "").strip()
+            model = str(payload.get("model") or "").strip()
+            reasoning = str(
+                payload.get("reasoning_effort") or payload.get("reasoning") or ""
+            ).strip().lower()
+            if model:
+                changed = (
+                    provider != self._active_provider or model != self._active_model
+                )
+                self._active_provider = provider
+                self._active_model = model
+                self._mark_provider_health(provider, model, "ready", "session.info")
+                if changed:
+                    self.activeModelChanged.emit(provider, model)
+            if reasoning:
+                self.activeReasoningChanged.emit(reasoning)
             tools = payload.get("tools") if isinstance(payload.get("tools"), dict) else {}
             self.integrationsChanged.emit(sorted(map(str, tools.keys())))
         elif event_type == "message.start":
@@ -690,6 +941,19 @@ class HermesService(QObject):
                 bool(payload.get("already_streamed")),
             )
         elif event_type == "message.complete":
+            surface = payload.get("error_surface")
+            if isinstance(surface, dict):
+                code = str(surface.get("code") or "")
+                provider = str(surface.get("provider") or self._active_provider)
+                model = str(surface.get("model") or self._active_model)
+                if code in {"rate_limit", "quota_exceeded", "billing_blocked"}:
+                    self._mark_provider_health(
+                        provider,
+                        model,
+                        "cooldown",
+                        code,
+                        cooldown_until=surface.get("retry_at") or surface.get("reset_at"),
+                    )
             self.assistantCompleted.emit(
                 str(payload.get("text") or payload.get("content") or payload.get("message") or ""),
                 bool(payload.get("response_previewed")),
@@ -742,19 +1006,76 @@ class HermesService(QObject):
     def _on_process_running(self, running: bool) -> None:
         if running or not self._want_running:
             return
+        self._restart_stability_timer.stop()
         self.client.close()
-        self._restart_attempts += 1
-        if self._restart_attempts > 5:
+        if not self.settings.router.auto_recovery:
             self._set_status("error")
-            self.errorOccurred.emit("Hermes backend repeatedly exited; use Reconnect to retry")
+            self.errorOccurred.emit("Hermes backend stopped; automatic recovery is disabled")
             return
-        delay_ms = min(15_000, 500 * (2 ** (self._restart_attempts - 1)))
-        self._set_status("restarting")
+        now = time.monotonic()
+        window = float(self.settings.router.backend_restart_window_seconds)
+        while self._backend_failures and now - self._backend_failures[0] > window:
+            self._backend_failures.popleft()
+        self._backend_failures.append(now)
+        self._restart_attempts += 1
+        if len(self._backend_failures) > int(self.settings.router.backend_restart_limit):
+            delay_ms = int(self.settings.router.backend_circuit_seconds * 1000)
+            self._set_status("recovering")
+            self.errorOccurred.emit(
+                "Hermes backend restart circuit is open; automatic recovery will retry"
+            )
+        else:
+            delay_ms = min(15_000, 500 * (2 ** (self._restart_attempts - 1)))
+            self._set_status("restarting")
         self._restart_timer.start(delay_ms)
 
     def _restart_owned_backend(self) -> None:
         if self._want_running:
             self._launch_owned_backend()
+
+    def _reset_restart_budget(self) -> None:
+        self._restart_attempts = 0
+        self._backend_failures.clear()
+
+    def _set_self_mcp_status(self, status: str) -> None:
+        if status == self._self_mcp_status:
+            return
+        self._self_mcp_status = status
+        self.selfMcpStatusChanged.emit(status)
+
+    def _mark_provider_health(
+        self,
+        provider: str,
+        model: str,
+        state: str,
+        detail: str,
+        *,
+        cooldown_until: object = None,
+    ) -> None:
+        key = f"{provider}/{model}"
+        health = {
+            "provider": provider,
+            "model": model,
+            "state": state,
+            "detail": detail,
+            "cooldownUntil": str(cooldown_until or ""),
+            "subscriptionPercent": None,
+            "subscriptionDetail": "Not exposed by Hermes Gateway",
+        }
+        if self._provider_health.get(key) == health:
+            return
+        self._provider_health[key] = health
+        self.routeHealthChanged.emit(self.routeHealth)
+        self.structuredEvent.emit(
+            {
+                "type": "hal.model.provider_health.changed",
+                "session_id": self._runtime_session_id,
+                "payload": {
+                    **health,
+                    "health_transition_id": f"{time.monotonic_ns()}:{key}",
+                },
+            }
+        )
 
     @staticmethod
     def _log_process_output(text: str) -> None:

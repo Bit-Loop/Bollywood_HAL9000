@@ -63,9 +63,15 @@ def _dimension(value: MachineDimension, *, compact: bool = False) -> dict[str, A
 class ContextCompiler:
     """Read exact projections first, then add only bounded relevant memory."""
 
-    def __init__(self, database: SentienceDatabase, settings: SentienceSettings) -> None:
+    def __init__(
+        self,
+        database: SentienceDatabase,
+        settings: SentienceSettings,
+        operator_preferred_name: str = "",
+    ) -> None:
         self.database = database
         self.settings = settings
+        self.operator_preferred_name = operator_preferred_name.strip()
         self.retriever = MemoryRetriever(database, settings.retrieval)
         self.language_gate = SparseInteroceptionLanguageGate()
 
@@ -380,6 +386,12 @@ class ContextCompiler:
             ),
             "interoception": {name: _dimension(value) for name, value in dimensions.items()},
         }
+        if self.operator_preferred_name:
+            data["operator"] = {
+                "preferred_name": self.operator_preferred_name,
+                "source": "user_configuration",
+                "authority": False,
+            }
         if self.settings.interoception.emit_language_on_threshold_crossing:
             cues = self.language_gate.update(snapshot)
             if cues:

@@ -45,10 +45,12 @@ def test_machine_self_lifecycle_capsule_structured_events_and_forensic_action(tm
     service = MachineSelfService(_paths(tmp_path), config, tmp_path)
     service.start()
     try:
+        service.update_operator_preferred_name("Isaiah")
         prepared = service.prepare_prompt("Inspect and repair the repository")
         assert prepared.task_id
         assert "<hal_machine_self" in prepared.text
         assert prepared.capsule.token_count <= config.sentience.retrieval.self_capsule_tokens
+        assert prepared.capsule.data["operator"]["preferred_name"] == "Isaiah"
 
         service.observe_hermes_event(_session_info()).result(timeout=10)
         task_id = service.mapper._task_by_session["hermes-session-1"]
@@ -156,3 +158,70 @@ def test_duplicate_canonical_writer_is_rejected(tmp_path) -> None:
     finally:
         second.stop()
         first.stop()
+
+
+def test_model_route_decision_is_exact_and_transactionally_projected(tmp_path) -> None:
+    service = MachineSelfService(_paths(tmp_path), AppConfig(), tmp_path)
+    service.start()
+    try:
+        prepared = service.prepare_prompt("Implement the requested repository change")
+        service.observe_hermes_event(
+            {
+                "type": "hal.model.route.decided",
+                "session_id": "session-route",
+                "payload": {
+                    "decision_id": "route-1",
+                    "policy_version": 1,
+                    "intent_class": "complex_or_coding",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning": "medium",
+                    "available": True,
+                    "user_override": False,
+                    "reason": "exact task policy selected the complex/coding route",
+                    "rejected_candidates": [],
+                    "task_id": prepared.task_id,
+                },
+            }
+        ).result(timeout=10)
+        with service.database.read_connection() as connection:
+            route = connection.execute(
+                "SELECT * FROM model_route_decisions WHERE decision_id='route-1'"
+            ).fetchone()
+            event = connection.execute(
+                "SELECT * FROM exact_events WHERE event_id=?",
+                (route["evidence_event_id"],),
+            ).fetchone()
+        assert route["selected_model"] == "gpt-5.6-sol"
+        assert route["available"] == 1
+        assert route["task_id"] == prepared.task_id
+        assert event["type"] == "model.route.decided"
+        assert event["retention_class"] == "forever"
+
+        service.observe_hermes_event(
+            {
+                "type": "hal.model.provider_health.changed",
+                "session_id": "session-route",
+                "payload": {
+                    "health_transition_id": "health-1",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "state": "cooldown",
+                    "detail": "rate_limit",
+                    "cooldownUntil": "2026-08-26T04:00:00Z",
+                },
+            }
+        ).result(timeout=10)
+        with service.database.read_connection() as connection:
+            health = connection.execute(
+                "SELECT * FROM model_provider_health WHERE provider='openai-codex' "
+                "AND model='gpt-5.6-sol'"
+            ).fetchone()
+            health_event = connection.execute(
+                "SELECT * FROM exact_events WHERE event_id=?",
+                (health["evidence_event_id"],),
+            ).fetchone()
+        assert health["state"] == "cooldown"
+        assert health_event["type"] == "model.provider.health.changed"
+    finally:
+        service.stop()

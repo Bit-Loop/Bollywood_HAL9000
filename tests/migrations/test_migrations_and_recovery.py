@@ -56,7 +56,7 @@ def test_empty_database_migration_and_fts5_unavailable_metadata_fallback(tmp_pat
     database._fts5_available = lambda: False  # type: ignore[method-assign]
     database._open()
     try:
-        assert database.migration_version == 4
+        assert database.migration_version == 5
         assert "retrieval_fts" not in database.table_names()
         identity = IdentityService(database).load_or_create()
         boot = ContinuityService(database, identity.incarnation_id).start_boot()
@@ -108,7 +108,9 @@ def test_upgrade_from_schema_v1_is_transactional_and_creates_backup(tmp_path) ->
 
     database = SentienceDatabase.open(paths, AppConfig().sentience)
     try:
-        assert database.migration_version == 4
+        assert database.migration_version == 5
+        assert "model_provider_health" in database.table_names()
+        assert "model_route_decisions" in database.table_names()
         assert "operational_metrics_current" in database.table_names()
         with database.read_connection() as connection:
             columns = {
@@ -142,6 +144,62 @@ def test_migration_checksum_drift_is_rejected(tmp_path) -> None:
     reopened = SentienceDatabase(paths.sentience_database, AppConfig().sentience)
     try:
         with pytest.raises(RuntimeError, match="checksum drift"):
+            reopened._open()
+    finally:
+        reopened.close()
+
+
+def test_known_whitespace_only_v2_checksum_is_accepted_after_schema_verification(
+    tmp_path,
+) -> None:
+    paths = _paths(tmp_path)
+    database = SentienceDatabase.open(paths, AppConfig().sentience)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE schema_migrations SET checksum=? WHERE version=2",
+            (
+                "sha256:ae52ae2a0dd1d3f6ba0828b0019ece9caad3c841b61102cd616e503ffd572e45",
+            ),
+        )
+    database.close()
+
+    reopened = SentienceDatabase.open(paths, AppConfig().sentience)
+    try:
+        assert reopened.migration_version >= 4
+    finally:
+        reopened.close()
+
+
+def test_known_v2_checksum_is_rejected_when_required_schema_is_missing(tmp_path) -> None:
+    paths = _paths(tmp_path)
+    database = SentienceDatabase.open(paths, AppConfig().sentience)
+    database.close()
+    raw = sqlite3.connect(paths.sentience_database)
+    try:
+        raw.execute("ALTER TABLE degradation_episodes RENAME TO degradation_episodes_valid")
+        raw.execute(
+            "CREATE TABLE degradation_episodes AS SELECT "
+            "episode_id,state,started_at,aggregation_closed_at,nominal_profile,active_profile,"
+            "severity,lost_capabilities_json,affected_tasks_json,fallback_model,cause_event_ids_json,"
+            "phrase_outbox_id,phrase_emitted,recovery_started_at,recovered_at,recovery_phrase_outbox_id,"
+            "recovery_phrase_emitted,conclusions_requiring_revalidation_json,last_transition_event_id,"
+            "timer_boot_id,started_monotonic_ns,recovery_started_monotonic_ns,recovered_monotonic_ns "
+            "FROM degradation_episodes_valid"
+        )
+        raw.execute("DROP TABLE degradation_episodes_valid")
+        raw.execute(
+            "UPDATE schema_migrations SET checksum=? WHERE version=2",
+            (
+                "sha256:ae52ae2a0dd1d3f6ba0828b0019ece9caad3c841b61102cd616e503ffd572e45",
+            ),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    reopened = SentienceDatabase(paths.sentience_database, AppConfig().sentience)
+    try:
+        with pytest.raises(RuntimeError, match="schema verification"):
             reopened._open()
     finally:
         reopened.close()

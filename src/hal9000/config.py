@@ -12,7 +12,7 @@ from typing import Any, TypeVar
 
 from hal9000.paths import AppPaths
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 T = TypeVar("T")
 _DURATION = re.compile(r"^(\d+)(s|m|h|d)$", re.IGNORECASE)
 
@@ -46,16 +46,49 @@ class GeneralSettings:
 
 
 @dataclass(slots=True)
+class HermesRouterSettings:
+    enabled: bool = True
+    policy: str = "task_aware"
+    resource_policy: str = "balanced"
+    auto_recovery: bool = True
+    default_provider: str = "openai-codex"
+    default_model: str = "gpt-5.6-terra"
+    default_reasoning: str = "medium"
+    complex_provider: str = "openai-codex"
+    complex_model: str = "gpt-5.6-sol"
+    complex_reasoning: str = "medium"
+    resource_freshness_seconds: int = 10
+    local_memory_reserve_ratio: float = 0.20
+    self_mcp_retry_max_seconds: int = 60
+    backend_restart_window_seconds: int = 600
+    backend_restart_limit: int = 5
+    backend_circuit_seconds: int = 60
+    recovery_stability_seconds: int = 30
+    local_model_memory_mb: dict[str, int] = field(
+        default_factory=lambda: {
+            "qwen-ollama/qwen2.5-coder-hermes:7b-q6_K": 7000,
+            "qwen-ollama/qwen3-coder-hermes:30b-a3b-q8_0": 32768,
+        }
+    )
+
+
+@dataclass(slots=True)
 class HermesSettings:
     executable: str = ""
     mode: str = "local"
     backend_url: str = "http://127.0.0.1:9119"
     profile: str = "codex-cloud"
     provider: str = "openai-codex"
-    model: str = "gpt-5.6-sol"
+    model: str = "gpt-5.6-terra"
     reasoning_effort: str = "medium"
     auto_start: bool = True
     last_session_id: str = ""
+    router: HermesRouterSettings = field(default_factory=HermesRouterSettings)
+
+
+@dataclass(slots=True)
+class OperatorSettings:
+    preferred_name: str = ""
 
 
 @dataclass(slots=True)
@@ -84,6 +117,7 @@ class VoiceSettings:
     output_device: str = ""
     volume: float = 0.82
     speaking_rate: float = 1.0
+    response_mode: str = "always"
     auto_benchmark_complete: bool = False
     selected_engine: str = "Piper"
     last_fallback_reason: str = ""
@@ -194,6 +228,7 @@ class AppConfig:
     version: int = CONFIG_VERSION
     general: GeneralSettings = field(default_factory=GeneralSettings)
     hermes: HermesSettings = field(default_factory=HermesSettings)
+    operator: OperatorSettings = field(default_factory=OperatorSettings)
     wake: WakeSettings = field(default_factory=WakeSettings)
     stt: SpeechRecognitionSettings = field(default_factory=SpeechRecognitionSettings)
     voice: VoiceSettings = field(default_factory=VoiceSettings)
@@ -222,8 +257,52 @@ class AppConfig:
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
         }:
             self.hermes.reasoning_effort = "medium"
+        router = self.hermes.router
+        if router.policy not in {"task_aware", "availability_only"}:
+            router.policy = "task_aware"
+        if router.resource_policy not in {"balanced", "constrained", "offline_local"}:
+            router.resource_policy = "balanced"
+        for name in (
+            "default_provider",
+            "default_model",
+            "complex_provider",
+            "complex_model",
+        ):
+            setattr(router, name, str(getattr(router, name) or "").strip())
+        for name in ("default_reasoning", "complex_reasoning"):
+            effort = str(getattr(router, name) or "medium").strip().lower()
+            if effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+                effort = "medium"
+            setattr(router, name, effort)
+        router.resource_freshness_seconds = max(1, int(router.resource_freshness_seconds))
+        router.local_memory_reserve_ratio = min(
+            0.75, max(0.05, float(router.local_memory_reserve_ratio))
+        )
+        router.self_mcp_retry_max_seconds = int(router.self_mcp_retry_max_seconds)
+        if router.self_mcp_retry_max_seconds <= 0:
+            router.self_mcp_retry_max_seconds = 60
+        router.backend_restart_window_seconds = max(
+            30, int(router.backend_restart_window_seconds)
+        )
+        router.backend_restart_limit = max(1, int(router.backend_restart_limit))
+        router.backend_circuit_seconds = max(1, int(router.backend_circuit_seconds))
+        router.recovery_stability_seconds = max(1, int(router.recovery_stability_seconds))
+        router.local_model_memory_mb = {
+            str(key).strip(): max(1, int(value))
+            for key, value in dict(router.local_model_memory_mb or {}).items()
+            if str(key).strip()
+        }
+        operator_name = str(self.operator.preferred_name or "").replace("\r", "\n").split("\n", 1)[0]
+        operator_name = " ".join(operator_name.strip().split())
+        self.operator.preferred_name = "".join(
+            character
+            for character in operator_name
+            if character.isalnum() or character in " ._-'"
+        )[:80]
         if self.voice.mode not in {"auto", "xtts", "piper"}:
             self.voice.mode = "piper"
+        if self.voice.response_mode not in {"always", "voice_prompts", "text_only"}:
+            self.voice.response_mode = "always"
         self.wake.sensitivity = min(1.0, max(0.0, float(self.wake.sensitivity)))
         self.voice.volume = min(1.0, max(0.0, float(self.voice.volume)))
         self.voice.speaking_rate = min(2.0, max(0.5, float(self.voice.speaking_rate)))
@@ -369,6 +448,14 @@ def _sentience_from_dict(raw: Any) -> SentienceSettings:
     )
 
 
+def _hermes_from_dict(raw: Any) -> HermesSettings:
+    values = raw if isinstance(raw, dict) else {}
+    scalar = {key: value for key, value in values.items() if key != "router"}
+    settings = _dataclass_from_dict(HermesSettings, scalar)
+    settings.router = _dataclass_from_dict(HermesRouterSettings, values.get("router"))
+    return settings
+
+
 class ConfigStore:
     def __init__(self, paths: AppPaths | None = None) -> None:
         self.paths = paths or AppPaths.discover()
@@ -391,20 +478,32 @@ class ConfigStore:
         config = AppConfig(
             version=source_version,
             general=_dataclass_from_dict(GeneralSettings, raw.get("general")),
-            hermes=_dataclass_from_dict(HermesSettings, raw.get("hermes")),
+            hermes=_hermes_from_dict(raw.get("hermes")),
+            operator=_dataclass_from_dict(OperatorSettings, raw.get("operator")),
             wake=_dataclass_from_dict(WakeSettings, raw.get("wake")),
             stt=_dataclass_from_dict(SpeechRecognitionSettings, raw.get("stt")),
             voice=_dataclass_from_dict(VoiceSettings, raw.get("voice")),
             appearance=_dataclass_from_dict(AppearanceSettings, raw.get("appearance")),
             sentience=_sentience_from_dict(raw.get("sentience")),
         )
+        if source_version < 5:
+            if (
+                config.hermes.provider == "openai-codex"
+                and config.hermes.model in {"", "gpt-5.6-sol", "gpt-5.6-terra"}
+            ):
+                config.hermes.model = "gpt-5.6-terra"
+                config.hermes.router.enabled = True
+            else:
+                # A non-default legacy choice is evidence of a user override;
+                # preserve it as a sticky manual route on upgrade.
+                config.hermes.router.enabled = False
         if source_version < 3:
             if (
                 config.hermes.provider == "openai-codex"
                 and config.hermes.model in {"", "gpt-5.6-terra"}
             ):
                 config.hermes.profile = "codex-cloud"
-                config.hermes.model = "gpt-5.6-sol"
+                config.hermes.model = "gpt-5.6-terra"
             if (
                 config.voice.mode == "auto"
                 and config.voice.selected_engine in {"", "XTTS"}

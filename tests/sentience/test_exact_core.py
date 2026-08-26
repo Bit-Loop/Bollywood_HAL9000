@@ -72,7 +72,7 @@ def test_migrations_create_required_schema_and_sqlite_policy(tmp_path) -> None:
         assert pragmas["foreign_keys"] == 1
         assert pragmas["journal_mode"] == "wal"
         assert pragmas["synchronous"] == 2
-        assert database.migration_version >= 1
+        assert database.migration_version >= 5
     finally:
         database.close()
 

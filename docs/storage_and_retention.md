@@ -31,7 +31,7 @@ Maintenance is incremental: passive WAL checkpoints, bounded candidate queries, 
 
 Sketch settings select provider, HMAC-key location, exact-to-HLL thresholds, HLL `lg_k` and target type, and hot/warm/cold bucket widths and retention. Retrieval settings define self-capsule, voice, typed, forensic-expansion, and depth budgets. Interoception settings define minimum baseline samples, formula version, and sparse language emission. Degradation settings define aggregation, stable-recovery, flap-suppression intervals, and the two exact phrases. Ratios must sum to one; intervals, capacities, HLL parameters, and token budgets are validated.
 
-The complete version-4 default section is:
+The complete version-5 machine-self default section is:
 
 ```yaml
 sentience:

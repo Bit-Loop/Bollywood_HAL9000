@@ -181,6 +181,42 @@ def test_required_responsive_sizes_keep_physical_components_in_bounds(qtbot, tmp
         close_ui(qtbot, controller, engine, window)
 
 
+def test_settings_refresh_does_not_reapply_persisted_window_geometry(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        window.setWidth(1080)
+        window.setHeight(1920)
+        QTest.qWait(40)
+
+        controller.updateSetting("voice.volume", 0.37)
+        QTest.qWait(80)
+
+        assert window.property("width") == 1080
+        assert window.property("height") == 1920
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
+def test_narrow_settings_use_responsive_navigation_and_stacked_rows(qtbot, tmp_path) -> None:
+    controller, engine, window = build_ui(qtbot, tmp_path)
+    try:
+        window.setWidth(600)
+        window.setHeight(800)
+        controller.openSettings()
+        QTest.qWait(80)
+
+        overlay = window.findChild(QObject, "settingsOverlay")
+        navigation = window.findChild(QObject, "settingsNavigation")
+        model_selector = window.findChild(QObject, "hermesModelSelector")
+        assert overlay is not None and navigation is not None and model_selector is not None
+        assert overlay.property("compact") is True
+        assert navigation.property("horizontalNavigation") is True
+        assert model_selector.property("popupMaximumWidth") > model_selector.property("width")
+        assert model_selector.property("popupMaximumWidth") <= window.property("width") - 24
+    finally:
+        close_ui(qtbot, controller, engine, window)
+
+
 def test_hal_chassis_spans_window_width_without_stretching_optics(qtbot, tmp_path) -> None:
     controller, engine, window = build_ui(qtbot, tmp_path)
     try:
